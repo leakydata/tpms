@@ -80,6 +80,14 @@ def api_stats():
             FROM readings GROUP BY model ORDER BY cnt DESC
         """).fetchall()
 
+        # Unknown signals count
+        unknown_tables = [r[0] for r in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='unknown_signals'"
+        ).fetchall()]
+        unknown_count = 0
+        if "unknown_signals" in unknown_tables:
+            unknown_count = db.execute("SELECT COUNT(*) FROM unknown_signals").fetchone()[0]
+
         return jsonify({
             "total_signals": total_signals,
             "total_readings": total_readings,
@@ -87,6 +95,7 @@ def api_stats():
             "non_tpms_signals": non_tpms_signals,
             "unique_sensors": unique_sensors,
             "est_vehicles": est_vehicles,
+            "unknown_signals": unknown_count,
             "first_reading": first,
             "last_reading": last,
             "readings_315": r315,
@@ -297,6 +306,84 @@ def api_live():
 
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/unknown")
+def api_unknown():
+    db = get_db()
+    try:
+        # Check table exists first
+        tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='unknown_signals'").fetchall()]
+        if "unknown_signals" not in tables:
+            return jsonify({"total": 0, "unknowns": [], "page": 1, "pages": 0})
+
+        page = request.args.get("page", 1, type=int)
+        per_page = request.args.get("per_page", 50, type=int)
+        offset = (page - 1) * per_page
+        total = db.execute("SELECT COUNT(*) FROM unknown_signals").fetchone()[0]
+        rows = db.execute("SELECT * FROM unknown_signals ORDER BY timestamp DESC LIMIT ? OFFSET ?", (per_page, offset)).fetchall()
+        return jsonify({
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": (total + per_page - 1) // per_page,
+            "unknowns": [dict(r) for r in rows],
+        })
+    finally:
+        db.close()
+
+
+@app.route("/api/sensor/<sensor_id>")
+def api_sensor_detail(sensor_id):
+    db = get_db()
+    try:
+        sensor = db.execute("SELECT * FROM sensors WHERE sensor_id = ?", (sensor_id,)).fetchone()
+        if not sensor:
+            return jsonify({"error": "not found"}), 404
+        readings = db.execute(
+            "SELECT timestamp, pressure_kpa, temperature_c, battery_ok, flags FROM readings WHERE sensor_id = ? ORDER BY timestamp DESC LIMIT 200",
+            (sensor_id,)
+        ).fetchall()
+        return jsonify({
+            "sensor": dict(sensor),
+            "readings": [dict(r) for r in readings],
+        })
+    finally:
+        db.close()
+
+
+@app.route("/api/export/readings")
+def api_export_readings():
+    db = get_db()
+    try:
+        rows = db.execute("SELECT timestamp, frequency_mhz, protocol, model, sensor_id, pressure_kpa, temperature_c, battery_ok, flags FROM readings ORDER BY timestamp").fetchall()
+        def generate():
+            yield "timestamp,frequency_mhz,protocol,model,sensor_id,pressure_kpa,temperature_c,battery_ok,flags\n"
+            for r in rows:
+                yield ",".join(str(v) if v is not None else "" for v in r) + "\n"
+        return Response(generate(), mimetype="text/csv",
+                       headers={"Content-Disposition": "attachment; filename=tpms_readings.csv"})
+    finally:
+        db.close()
+
+
+@app.route("/api/export/sensors")
+def api_export_sensors():
+    db = get_db()
+    try:
+        rows = db.execute("SELECT * FROM sensors ORDER BY last_seen DESC").fetchall()
+        if not rows:
+            return Response("", mimetype="text/csv",
+                           headers={"Content-Disposition": "attachment; filename=tpms_sensors.csv"})
+        columns = rows[0].keys()
+        def generate():
+            yield ",".join(columns) + "\n"
+            for r in rows:
+                yield ",".join(str(v) if v is not None else "" for v in r) + "\n"
+        return Response(generate(), mimetype="text/csv",
+                       headers={"Content-Disposition": "attachment; filename=tpms_sensors.csv"})
+    finally:
+        db.close()
 
 
 def main():

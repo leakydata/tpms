@@ -201,6 +201,7 @@
         <a href="/readings" {% if request.path == '/readings' %}class="active"{% endif %}>Readings</a>
         <a href="/sensors" {% if request.path == '/sensors' %}class="active"{% endif %}>Sensors</a>
         <a href="/signals" {% if request.path == '/signals' %}class="active"{% endif %}>All Signals</a>
+        <a href="/unknown" {% if request.path == '/unknown' %}class="active"{% endif %}>Unknown</a>
     </nav>
     <div class="container">
         {% block content %}{% endblock %}

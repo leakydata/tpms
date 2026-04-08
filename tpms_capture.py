@@ -392,6 +392,18 @@ class TPMSCapture:
             else:
                 log_sdr(f"[{freq_label}] {line}")
 
+    def _store_unknown(self, device_index, freq_label, analysis_text):
+        """Store an unknown signal detection."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.lock:
+            self.conn.execute(
+                """INSERT INTO unknown_signals (timestamp, device_index, frequency_label, analysis_text)
+                   VALUES (?, ?, ?, ?)""",
+                (now, device_index, freq_label, analysis_text),
+            )
+            self.conn.commit()
+            self.stats["unknown_signals"] += 1
+
     def _register_receiver(self, device_index, freq_label, frequency, pid):
         """Register a receiver in the database."""
         now = datetime.now(timezone.utc).isoformat()
@@ -738,6 +750,7 @@ class TPMSCapture:
             f"signals={self.stats.get('total_signals', 0)}  "
             f"tpms_readings={self.stats['total_readings']} (315:{r315} 433:{r433})  "
             f"non_tpms={self.stats.get('non_tpms_signals', 0)}  "
+            f"unknown={self.stats.get('unknown_signals', 0)}  "
             f"sensors={self.stats['unique_sensors']}  "
             f"est_vehicles=~{est_v}"
         )
@@ -802,6 +815,7 @@ class TPMSCapture:
         print(f"  Total signals:      {self.stats.get('total_signals', 0)}")
         print(f"  TPMS readings:      {self.stats['total_readings']}")
         print(f"  Non-TPMS signals:   {self.stats.get('non_tpms_signals', 0)}")
+        print(f"  Unknown signals:    {self.stats.get('unknown_signals', 0)}")
         print(f"  Unique TPMS sensors:{self.stats['unique_sensors']}")
         print(f"  Est. vehicles:      ~{est}")
         print(f"  315 MHz readings:   {self.stats.get('readings_315MHz', 0)}")
