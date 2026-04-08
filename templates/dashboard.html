@@ -20,6 +20,7 @@
     <div class="stat-card"><div class="label">TPMS Readings</div><div class="value green" id="stat-readings">-</div></div>
     <div class="stat-card"><div class="label">Unique Sensors</div><div class="value yellow" id="stat-sensors">-</div></div>
     <div class="stat-card"><div class="label">Est. Vehicles</div><div class="value magenta" id="stat-vehicles">-</div></div>
+    <div class="stat-card"><div class="label">Unknown Signals</div><div class="value" id="stat-unknown" style="color:var(--orange,#d18616)">-</div></div>
     <div class="stat-card"><div class="label">315 MHz</div><div class="value" id="stat-315" style="color:var(--text)">-</div></div>
     <div class="stat-card"><div class="label">433 MHz</div><div class="value" id="stat-433" style="color:var(--text)">-</div></div>
 </div>
@@ -255,6 +256,9 @@ function loadStats() {
             document.getElementById('stat-vehicles').textContent = '~' + data.est_vehicles;
             document.getElementById('stat-315').textContent = data.readings_315.toLocaleString();
             document.getElementById('stat-433').textContent = data.readings_433.toLocaleString();
+            if (data.unknown_signals !== undefined) {
+                document.getElementById('stat-unknown').textContent = data.unknown_signals.toLocaleString();
+            }
 
             let html = '';
             for (let p of data.protocols) {

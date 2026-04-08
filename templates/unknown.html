@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Unknown Signals{% endblock %}
+{% block content %}
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+    <div>
+        <h1 style="font-size:1.5em">Unknown Signals</h1>
+        <p class="dim" style="margin-top:4px">Signals detected by the SDR but not decoded by any known protocol. These may be TPMS from unsupported vehicles, interference, or other RF sources.</p>
+    </div>
+    <button type="button" onclick="loadUnknowns(currentPage)" style="background:var(--bg-card);border:1px solid var(--border);color:var(--cyan);padding:8px 16px;border-radius:6px;cursor:pointer;font-size:0.9em">Refresh</button>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card"><div class="label">Total Unknown</div><div class="value" id="stat-total" style="color:var(--orange)">-</div></div>
+</div>
+
+<div class="card">
+    <div style="overflow-x:auto">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Timestamp</th>
+                    <th>Band</th>
+                    <th>Analysis</th>
+                </tr>
+            </thead>
+            <tbody id="unknowns-tbody">
+                <tr><td colspan="4" class="empty">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div class="pagination" id="pagination"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentPage = 1;
+
+function truncate(text, maxLen) {
+    if (!text) return '-';
+    if (text.length <= maxLen) return text;
+    return text.substring(0, maxLen) + '...';
+}
+
+function loadUnknowns(page) {
+    currentPage = page || 1;
+    const params = new URLSearchParams({page: currentPage, per_page: 50});
+
+    fetch('/api/unknown?' + params)
+        .then(r => r.json())
+        .then(data => {
+            document.getElementById('stat-total').textContent = data.total.toLocaleString();
+
+            let html = '';
+            for (let u of data.unknowns) {
+                let bandLabel = '-';
+                let bandClass = 'badge-cyan';
+                if (u.frequency_mhz) {
+                    if (u.frequency_mhz < 400) { bandLabel = '315'; bandClass = 'badge-green'; }
+                    else { bandLabel = '433'; bandClass = 'badge-cyan'; }
+                } else if (u.band) {
+                    bandLabel = u.band;
+                    bandClass = bandLabel.includes('315') ? 'badge-green' : 'badge-cyan';
+                }
+
+                let analysis = u.analysis || u.raw_data || u.description || '-';
+                let analysisShort = truncate(analysis, 100);
+
+                html += `<tr>
+                    <td class="mono dim">${u.id || '-'}</td>
+                    <td class="mono dim">${u.timestamp || '-'}</td>
+                    <td><span class="badge ${bandClass}">${bandLabel}</span></td>
+                    <td title="${analysis.replace(/"/g, '&quot;')}">${analysisShort}</td>
+                </tr>`;
+            }
+            document.getElementById('unknowns-tbody').innerHTML = html || '<tr><td colspan="4" class="empty">No unknown signals recorded</td></tr>';
+
+            // Pagination
+            let pag = '';
+            if (data.pages > 0) {
+                pag += `<button onclick="loadUnknowns(${data.page - 1})" ${data.page <= 1 ? 'disabled' : ''}>Prev</button>`;
+                pag += `<span class="info">Page ${data.page} of ${data.pages} (${data.total.toLocaleString()} total)</span>`;
+                pag += `<button onclick="loadUnknowns(${data.page + 1})" ${data.page >= data.pages ? 'disabled' : ''}>Next</button>`;
+            }
+            document.getElementById('pagination').innerHTML = pag;
+        });
+}
+
+loadUnknowns(1);
+</script>
+{% endblock %}
