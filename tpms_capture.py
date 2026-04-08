@@ -522,8 +522,17 @@ class TPMSCapture:
         triq_url = triq_urls[0] if triq_urls else None
 
         # Structural fingerprint: hash of protocol-level features
-        # This is stable across different sensors using the same protocol
-        fp_input = f"{modulation or '?'}:{pulse_count or '?'}:{width_ms or '?'}"
+        # Uses bucketed values to group signals from the same protocol despite
+        # minor timing variations between transmissions.
+        # Pulse count bucketed to nearest 5, width to nearest 1ms,
+        # ms-per-pulse ratio to nearest 0.05ms (the fundamental timing unit).
+        if pulse_count and width_ms and pulse_count > 0:
+            ms_per_pulse = round(width_ms / pulse_count * 20) / 20  # nearest 0.05
+            pc_bucket = round(pulse_count / 5) * 5  # nearest 5
+            w_bucket = round(width_ms)  # nearest 1ms
+            fp_input = f"{modulation or '?'}:{pc_bucket}:{w_bucket}:{ms_per_pulse}"
+        else:
+            fp_input = f"{modulation or '?'}:{pulse_count or '?'}:{width_ms or '?'}"
         fingerprint = hashlib.sha256(fp_input.encode()).hexdigest()[:16]
 
         with self.lock:
