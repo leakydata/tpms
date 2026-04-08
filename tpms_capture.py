@@ -185,6 +185,18 @@ def init_db():
         )
     """)
 
+    # ── Auto-migrate: add columns that may be missing from older databases ──
+    # SQLite doesn't error on duplicate ALTER ADD, so we catch and ignore.
+    migrations = [
+        "ALTER TABLE readings ADD COLUMN signal_id INTEGER REFERENCES signals(id)",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+            log_db(f"Migration applied: {sql.strip()[:60]}...")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     # Set default station location if not already set
     conn.execute("INSERT OR IGNORE INTO station (key, value) VALUES ('lat', ?)", (str(DEFAULT_LAT),))
     conn.execute("INSERT OR IGNORE INTO station (key, value) VALUES ('lon', ?)", (str(DEFAULT_LON),))
