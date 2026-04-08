@@ -24,6 +24,10 @@ from collections import defaultdict
 
 DB_PATH = Path(__file__).parent / "tpms_data.db"
 
+# Default station location (used when no GPS dongle is present)
+DEFAULT_LAT = 40.224619417522824
+DEFAULT_LON = -77.2428142810988
+
 # Known TPMS protocol numbers in rtl_433.
 TPMS_PROTOCOLS = {
     59, 60, 82, 88, 89, 90, 95, 110, 123, 140, 156, 168, 180, 186,
@@ -141,6 +145,14 @@ def init_db():
         )
     """)
 
+    # Station metadata (fixed GPS, or updated by USB GPS)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS station (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
     # Receiver / dongle status (written by capture, read by web dashboard)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS receivers (
@@ -172,6 +184,10 @@ def init_db():
             notes TEXT
         )
     """)
+
+    # Set default station location if not already set
+    conn.execute("INSERT OR IGNORE INTO station (key, value) VALUES ('lat', ?)", (str(DEFAULT_LAT),))
+    conn.execute("INSERT OR IGNORE INTO station (key, value) VALUES ('lon', ?)", (str(DEFAULT_LON),))
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_model ON signals(model)")

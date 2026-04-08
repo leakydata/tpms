@@ -1,8 +1,13 @@
 {% extends "base.html" %}
 {% block title %}All Signals{% endblock %}
 {% block content %}
-<h1 style="font-size:1.5em;margin-bottom:24px">All Decoded Signals</h1>
-<p class="dim" style="margin-bottom:16px">Every signal decoded by rtl_433, including non-TPMS (weather stations, remotes, etc.)</p>
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+    <div>
+        <h1 style="font-size:1.5em">All Decoded Signals</h1>
+        <p class="dim" style="margin-top:4px">Every signal decoded by rtl_433, including non-TPMS (weather stations, remotes, etc.)</p>
+    </div>
+    <button type="button" onclick="loadSignals(currentPage)" style="background:var(--bg-card);border:1px solid var(--border);color:var(--cyan);padding:8px 16px;border-radius:6px;cursor:pointer;font-size:0.9em">Refresh</button>
+</div>
 
 <div class="card">
     <div class="filters">

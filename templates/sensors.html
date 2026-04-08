@@ -1,7 +1,10 @@
 {% extends "base.html" %}
 {% block title %}TPMS Sensors{% endblock %}
 {% block content %}
-<h1 style="font-size:1.5em;margin-bottom:24px">Tracked Sensors</h1>
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+    <h1 style="font-size:1.5em">Tracked Sensors</h1>
+    <button type="button" onclick="loadSensors();loadVehicles()" style="background:var(--bg-card);border:1px solid var(--border);color:var(--cyan);padding:8px 16px;border-radius:6px;cursor:pointer;font-size:0.9em">Refresh</button>
+</div>
 
 <div class="card">
     <div style="overflow-x:auto">

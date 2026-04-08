@@ -93,6 +93,19 @@ def api_stats():
         db.close()
 
 
+@app.route("/api/station")
+def api_station():
+    db = get_db()
+    try:
+        rows = db.execute("SELECT key, value FROM station").fetchall()
+        station = {r["key"]: r["value"] for r in rows}
+        return jsonify(station)
+    except Exception:
+        return jsonify({})
+    finally:
+        db.close()
+
+
 @app.route("/api/receivers")
 def api_receivers():
     db = get_db()

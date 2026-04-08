@@ -3,8 +3,16 @@
 {% block content %}
 <div style="display:flex;align-items:center;gap:12px;margin-bottom:24px">
     <h1 style="font-size:1.5em">Dashboard</h1>
-    <span class="live-dot"></span>
+    <span class="live-dot" id="live-dot"></span>
     <span class="dim" id="live-status">Connecting...</span>
+</div>
+
+<!-- Receiver status -->
+<div id="receivers-panel" class="card" style="margin-bottom:24px">
+    <h2 style="margin-bottom:12px">Receivers</h2>
+    <div id="receivers-grid" style="display:flex;gap:16px;flex-wrap:wrap">
+        <div class="dim">Loading receiver status...</div>
+    </div>
 </div>
 
 <div class="stats-grid" id="stats-cards">
@@ -49,6 +57,86 @@
 {% endblock %}
 
 {% block scripts %}
+<style>
+    .receiver-card {
+        background: var(--bg);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px 20px;
+        min-width: 280px;
+        flex: 1;
+        position: relative;
+    }
+    .receiver-card.running { border-color: var(--green); }
+    .receiver-card.error { border-color: var(--red); }
+    .receiver-card.stale { border-color: var(--yellow); }
+    .receiver-card.stopped { border-color: var(--text-dim); }
+    .receiver-card.starting { border-color: var(--cyan); }
+
+    .rx-status-dot {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin-right: 8px;
+        vertical-align: middle;
+    }
+    .rx-status-dot.running { background: var(--green); animation: pulse 2s infinite; }
+    .rx-status-dot.error { background: var(--red); }
+    .rx-status-dot.stale { background: var(--yellow); animation: pulse 3s infinite; }
+    .rx-status-dot.stopped { background: var(--text-dim); }
+    .rx-status-dot.starting { background: var(--cyan); animation: pulse 1s infinite; }
+
+    .rx-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 10px;
+    }
+    .rx-label {
+        font-weight: 700;
+        font-size: 1.1em;
+    }
+    .rx-status-badge {
+        font-size: 0.75em;
+        text-transform: uppercase;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        padding: 2px 8px;
+        border-radius: 4px;
+    }
+    .rx-status-badge.running { background: rgba(63,185,80,0.15); color: var(--green); }
+    .rx-status-badge.error { background: rgba(248,81,73,0.15); color: var(--red); }
+    .rx-status-badge.stale { background: rgba(210,153,34,0.15); color: var(--yellow); }
+    .rx-status-badge.stopped { background: rgba(139,148,158,0.15); color: var(--text-dim); }
+    .rx-status-badge.starting { background: rgba(88,166,255,0.15); color: var(--cyan); }
+
+    .rx-detail {
+        font-size: 0.85em;
+        color: var(--text-dim);
+        line-height: 1.8;
+    }
+    .rx-detail span.val { color: var(--text); font-family: 'SF Mono', monospace; }
+    .rx-error {
+        margin-top: 8px;
+        padding: 6px 10px;
+        background: rgba(248,81,73,0.1);
+        border-radius: 4px;
+        font-size: 0.8em;
+        color: var(--red);
+        font-family: monospace;
+        word-break: break-all;
+    }
+    .no-capture-banner {
+        text-align: center;
+        padding: 12px;
+        background: rgba(210,153,34,0.1);
+        border: 1px solid var(--yellow);
+        border-radius: 6px;
+        color: var(--yellow);
+        font-size: 0.9em;
+    }
+</style>
 <script>
 function formatTime(ts) {
     if (!ts) return '-';
@@ -86,6 +174,77 @@ function bandBadge(freq) {
     return '<span class="badge badge-cyan">433</span>';
 }
 
+function formatAge(secs) {
+    if (secs == null) return '-';
+    if (secs < 60) return secs + 's ago';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+    return Math.floor(secs / 3600) + 'h ago';
+}
+
+function loadReceivers() {
+    fetch('/api/receivers')
+        .then(r => r.json())
+        .then(data => {
+            const grid = document.getElementById('receivers-grid');
+
+            if (!data.receivers.length) {
+                grid.innerHTML = '<div class="no-capture-banner">No receivers detected. Start the capture tool: <code>uv run tpms-capture</code></div>';
+                return;
+            }
+
+            let html = '';
+            for (let rx of data.receivers) {
+                let s = rx.status || 'unknown';
+                let freqMhz = (rx.frequency_hz / 1e6).toFixed(3);
+                let lastSignalAge = '';
+                if (rx.last_signal_at) {
+                    try {
+                        let age = Math.round((Date.now() - new Date(rx.last_signal_at + 'Z').getTime()) / 1000);
+                        lastSignalAge = formatAge(age);
+                    } catch(e) { lastSignalAge = '-'; }
+                }
+
+                html += `
+                <div class="receiver-card ${s}">
+                    <div class="rx-header">
+                        <div>
+                            <span class="rx-status-dot ${s}"></span>
+                            <span class="rx-label">${rx.frequency_label}</span>
+                        </div>
+                        <span class="rx-status-badge ${s}">${s}</span>
+                    </div>
+                    <div class="rx-detail">
+                        Device <span class="val">#${rx.device_index}</span>
+                        &nbsp;&middot;&nbsp; <span class="val">${freqMhz} MHz</span>
+                        ${rx.tuner ? '&nbsp;&middot;&nbsp; ' + rx.tuner : ''}
+                        <br>
+                        PID <span class="val">${rx.pid || '-'}</span>
+                        &nbsp;&middot;&nbsp; Heartbeat: <span class="val">${rx.heartbeat_age_secs != null ? formatAge(rx.heartbeat_age_secs) : '-'}</span>
+                        <br>
+                        Signals: <span class="val">${(rx.signals_count || 0).toLocaleString()}</span>
+                        &nbsp;&middot;&nbsp; TPMS: <span class="val">${(rx.tpms_count || 0).toLocaleString()}</span>
+                        &nbsp;&middot;&nbsp; Last signal: <span class="val">${lastSignalAge || 'none yet'}</span>
+                    </div>
+                    ${rx.last_error ? '<div class="rx-error">' + rx.last_error + '</div>' : ''}
+                </div>`;
+            }
+            grid.innerHTML = html;
+
+            // Update global live dot based on capture state
+            const dot = document.getElementById('live-dot');
+            if (data.capture_running) {
+                dot.style.background = 'var(--green)';
+            } else {
+                dot.style.background = 'var(--red)';
+                dot.style.animation = 'none';
+            }
+        })
+        .catch(() => {
+            document.getElementById('receivers-grid').innerHTML =
+                '<div class="no-capture-banner">No receivers detected. Start the capture tool: <code>uv run tpms-capture</code></div>';
+        });
+}
+
 function loadStats() {
     fetch('/api/stats')
         .then(r => r.json())
@@ -97,14 +256,12 @@ function loadStats() {
             document.getElementById('stat-315').textContent = data.readings_315.toLocaleString();
             document.getElementById('stat-433').textContent = data.readings_433.toLocaleString();
 
-            // Protocols table
             let html = '';
             for (let p of data.protocols) {
                 html += `<tr><td><span class="mono">${p.model}</span></td><td>${p.readings}</td><td>${p.sensors}</td></tr>`;
             }
             document.getElementById('protocols-tbody').innerHTML = html || '<tr><td colspan="3" class="empty">No data yet</td></tr>';
 
-            // Capture window
             let cw = '';
             if (data.first_reading) {
                 cw = `First: ${data.first_reading}<br>Last: ${data.last_reading}`;
@@ -158,8 +315,10 @@ function renderLive() {
     document.getElementById('live-tbody').innerHTML = html || '<tr><td colspan="7" class="empty">Waiting for data...</td></tr>';
 }
 
+loadReceivers();
 loadStats();
 startSSE();
+setInterval(loadReceivers, 5000);
 setInterval(loadStats, 10000);
 </script>
 {% endblock %}
