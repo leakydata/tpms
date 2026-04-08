@@ -22,20 +22,21 @@ from collections import defaultdict, deque
 
 DB_PATH = Path(__file__).parent / "tpms_data.db"
 
-# TPMS protocol numbers in rtl_433
-TPMS_PROTOCOLS = [
+# Known TPMS protocol numbers in rtl_433 (used for identification alongside
+# the "type":"TPMS" JSON field and model name keyword matching).
+TPMS_PROTOCOLS = {
     59,   # Steelmate TPMS
     60,   # Schrader TPMS
     82,   # Citroen TPMS
     88,   # Toyota TPMS
     89,   # Ford TPMS
     90,   # Renault TPMS
-    95,   # Schrader TPMS EG53MA4
+    95,   # Schrader TPMS EG53MA4, Saab, Opel, Vauxhall, Chevrolet
     110,  # PMV-107J (Toyota) TPMS
-    123,  # Jansite TPMS Model TY02S
+    123,  # Jansite TPMS Model TY02S (disabled by default)
     140,  # Elantra2012 TPMS
     156,  # Abarth 124 Spider TPMS
-    168,  # Schrader TPMS SMD3MA4 (Subaru)
+    168,  # Schrader TPMS SMD3MA4 (Subaru) 3039 (Infiniti, Nissan, Renault)
     180,  # Jansite TPMS Model Solar
     186,  # Hyundai TPMS (VDO)
     201,  # Unbranded SolarTPMS for trucks
@@ -43,15 +44,23 @@ TPMS_PROTOCOLS = [
     208,  # AVE TPMS
     212,  # Renault 0435R TPMS
     225,  # TyreGuard 400 TPMS
-    226,  # Kia TPMS
-    241,  # EezTire E618 / Carchet / TST-507 TPMS
-    248,  # Nissan TPMS
-    252,  # BMW Gen4-Gen5 / Audi / HUF/Beru / Continental / Schrader
+    226,  # Kia TPMS (-s 1000k for dedicated capture)
+    241,  # EezTire E618, Carchet TPMS, TST-507 TPMS
+    248,  # Nissan TPMS (disabled by default)
+    252,  # BMW Gen4-Gen5 / Audi / HUF/Beru / Continental / Schrader/Sensata
     257,  # BMW Gen2 and Gen3 TPMS
     275,  # GM-Aftermarket TPMS
-    295,  # Airpuxem TPMS
-    298,  # TRW TPMS OOK
-    299,  # TRW TPMS FSK
+    295,  # Airpuxem TPMS TYH11_EU6_ZQ
+    298,  # TRW TPMS OOK OEM and Clone models
+    299,  # TRW TPMS FSK OEM and Clone models
+}
+
+# Protocols that are disabled by default in rtl_433 and must be explicitly
+# enabled with -R.  We enable all of these that might carry TPMS data.
+DISABLED_BY_DEFAULT = [
+    6, 7, 13, 14, 24, 37, 48, 61, 62, 64, 72, 86, 101, 106, 107,
+    117, 118, 123, 129, 150, 162, 169, 198, 200, 216, 233, 242, 245,
+    248, 260, 270,
 ]
 
 # ── Logging helpers ──────────────────────────────────────────────────────────
@@ -535,9 +544,16 @@ class TPMSCapture:
         self._decode_flush_timer = None
 
     def build_rtl433_cmd(self, device_index: int, frequency: float) -> list:
-        """Build rtl_433 command for a specific device and frequency."""
+        """Build rtl_433 command for a specific device and frequency.
+
+        Enables ALL protocols (including disabled-by-default ones) so we
+        catch every possible TPMS signal. Python-side filtering in is_tpms()
+        keeps only TPMS data. This future-proofs against new decoders added
+        to rtl_433 that we haven't listed yet.
+        """
+        # Enable disabled-by-default protocols
         protocol_args = []
-        for p in TPMS_PROTOCOLS:
+        for p in DISABLED_BY_DEFAULT:
             protocol_args.extend(["-R", str(p)])
 
         cmd = [
