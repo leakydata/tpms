@@ -141,6 +141,25 @@ def init_db():
         )
     """)
 
+    # Receiver / dongle status (written by capture, read by web dashboard)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS receivers (
+            device_index INTEGER PRIMARY KEY,
+            frequency_label TEXT NOT NULL,
+            frequency_hz INTEGER NOT NULL,
+            tuner TEXT,
+            serial TEXT,
+            pid INTEGER,
+            status TEXT NOT NULL DEFAULT 'starting',
+            started_at TEXT,
+            last_heartbeat TEXT,
+            last_signal_at TEXT,
+            signals_count INTEGER DEFAULT 0,
+            tpms_count INTEGER DEFAULT 0,
+            last_error TEXT
+        )
+    """)
+
     # Vehicle groups
     conn.execute("""
         CREATE TABLE IF NOT EXISTS vehicles (
@@ -266,6 +285,7 @@ class TPMSCapture:
         self._decode_buffer = []
         self._decode_buffer_key = None
         self._decode_flush_timer = None
+        self._receiver_info = {}  # device_index -> {label, freq, pid, status, ...}
 
     def build_rtl433_cmd(self, device_index: int, frequency: int) -> list:
         protocol_args = []
@@ -281,22 +301,85 @@ class TPMSCapture:
             "-F", "json",
         ] + protocol_args
 
-    def _stream_stderr(self, proc, freq_label: str):
+    def _stream_stderr(self, proc, freq_label: str, device_index: int):
         for line in proc.stderr:
             line = line.strip()
             if not line:
                 continue
             lower = line.lower()
+
+            # Capture tuner info for receiver status
+            if "found" in lower and "tuner" in lower:
+                tuner = line.split("Found ")[-1].strip() if "Found " in line else line
+                self._update_receiver(device_index, tuner=tuner)
+
             if "if you want" in lower:
                 log_sdr(f"[{freq_label}] {line}")
             elif "error" in lower or "fail" in lower:
                 log_error(f"[{freq_label}] {line}")
+                self._update_receiver(device_index, last_error=line)
             elif "pll not locked" in lower:
                 log_warn(f"[{freq_label}] {line} (usually harmless at startup)")
             elif "warning" in lower or "warn" in lower:
                 log_warn(f"[{freq_label}] {line}")
             else:
                 log_sdr(f"[{freq_label}] {line}")
+
+    def _register_receiver(self, device_index, freq_label, frequency, pid):
+        """Register a receiver in the database."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self.lock:
+            self.conn.execute("""
+                INSERT INTO receivers (device_index, frequency_label, frequency_hz, pid, status, started_at, last_heartbeat)
+                VALUES (?, ?, ?, ?, 'starting', ?, ?)
+                ON CONFLICT(device_index) DO UPDATE SET
+                    frequency_label = excluded.frequency_label,
+                    frequency_hz = excluded.frequency_hz,
+                    pid = excluded.pid,
+                    status = 'starting',
+                    started_at = excluded.started_at,
+                    last_heartbeat = excluded.last_heartbeat,
+                    signals_count = 0,
+                    tpms_count = 0,
+                    last_error = NULL,
+                    tuner = NULL,
+                    serial = NULL
+            """, (device_index, freq_label, frequency, pid, now, now))
+            self.conn.commit()
+        self._receiver_info[device_index] = {
+            "label": freq_label, "freq": frequency, "pid": pid,
+            "signals": 0, "tpms": 0,
+        }
+
+    def _update_receiver(self, device_index, status=None, tuner=None,
+                         last_error=None, signal_received=False, tpms_received=False):
+        """Update receiver status in the database."""
+        now = datetime.now(timezone.utc).isoformat()
+        sets = ["last_heartbeat = ?"]
+        params = [now]
+
+        if status:
+            sets.append("status = ?")
+            params.append(status)
+        if tuner:
+            sets.append("tuner = ?")
+            params.append(tuner)
+        if last_error:
+            sets.append("last_error = ?")
+            params.append(last_error)
+        if signal_received:
+            sets.append("signals_count = signals_count + 1")
+            sets.append("last_signal_at = ?")
+            params.append(now)
+        if tpms_received:
+            sets.append("tpms_count = tpms_count + 1")
+
+        with self.lock:
+            self.conn.execute(
+                f"UPDATE receivers SET {', '.join(sets)} WHERE device_index = ?",
+                params + [device_index],
+            )
+            self.conn.commit()
 
     def _score_decode(self, fields):
         score = 0
@@ -336,11 +419,20 @@ class TPMSCapture:
             if suppressed:
                 log_info(f"DEDUP: suppressed {len(suppressed)} duplicate(s): {', '.join(suppressed)}")
 
+    def _freq_label_to_device(self, freq_label):
+        """Resolve a freq_label back to a device_index."""
+        for idx, info in self._receiver_info.items():
+            if info["label"] == freq_label:
+                return idx
+        return None
+
     def _store_signal(self, data, freq_label, device_index=None):
         """Store any decoded signal in the signals table."""
         timestamp = data.get("time", datetime.now(timezone.utc).isoformat())
         sensor_id = str(data.get("id") or data.get("ID") or data.get("sensor_id")
                         or data.get("code") or data.get("address") or "")
+        if device_index is None:
+            device_index = self._freq_label_to_device(freq_label)
         with self.lock:
             self.conn.execute(
                 """INSERT INTO signals
@@ -357,6 +449,8 @@ class TPMSCapture:
             )
             self.conn.commit()
             self.stats["total_signals"] += 1
+        if device_index is not None:
+            self._update_receiver(device_index, signal_received=True)
 
     def _commit_tpms(self, data, fields, freq_label):
         """Store a TPMS decode in both signals and readings tables, update sensor."""
@@ -426,6 +520,10 @@ class TPMSCapture:
             self.unique_sensors.add(sid)
             self.stats["unique_sensors"] = len(self.unique_sensors)
             self.sensor_models[sid] = model
+
+        dev_idx = self._freq_label_to_device(freq_label)
+        if dev_idx is not None:
+            self._update_receiver(dev_idx, signal_received=True, tpms_received=True)
 
         # Build log line
         parts = [f"[{freq_label}] {C['bold']}{model}{C['reset']}  id={C['cyan']}{sid}{C['reset']}"]
@@ -504,33 +602,49 @@ class TPMSCapture:
             )
         except FileNotFoundError:
             log_error(f"[{freq_label}] rtl_433 not found!")
+            self._register_receiver(device_index, freq_label, frequency, 0)
+            self._update_receiver(device_index, status="error", last_error="rtl_433 not found")
             return
         except Exception as e:
             log_error(f"[{freq_label}] Failed to start rtl_433: {e}")
+            self._register_receiver(device_index, freq_label, frequency, 0)
+            self._update_receiver(device_index, status="error", last_error=str(e))
             return
 
         self.processes.append(proc)
+        self._register_receiver(device_index, freq_label, frequency, proc.pid)
         log_ok(f"[{freq_label}] rtl_433 started (PID {proc.pid})")
 
         stderr_t = threading.Thread(
-            target=self._stream_stderr, args=(proc, freq_label), daemon=True,
+            target=self._stream_stderr, args=(proc, freq_label, device_index),
+            daemon=True,
         )
         stderr_t.start()
         self.stderr_threads.append(stderr_t)
         log_info(f"[{freq_label}] Listening for signals...")
 
+        # Mark as running once we start reading
+        self._update_receiver(device_index, status="running")
+
         while self.running:
             line = proc.stdout.readline()
             if not line:
                 if proc.poll() is not None:
-                    if proc.returncode != 0 and self.running:
-                        log_error(f"[{freq_label}] rtl_433 exited with code {proc.returncode}")
+                    exit_code = proc.returncode
+                    if exit_code != 0 and self.running:
+                        log_error(f"[{freq_label}] rtl_433 exited with code {exit_code}")
+                        self._update_receiver(device_index, status="error",
+                                              last_error=f"exited with code {exit_code}")
+                    else:
+                        self._update_receiver(device_index, status="stopped")
                     break
                 continue
             self.process_line(line, freq_label)
 
         if self.running:
             log_warn(f"[{freq_label}] Receiver stopped unexpectedly")
+            self._update_receiver(device_index, status="error",
+                                  last_error="stopped unexpectedly")
 
     def print_periodic_status(self):
         elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
@@ -538,6 +652,15 @@ class TPMSCapture:
         secs = int(elapsed % 60)
         alive = sum(1 for p in self.processes if p.poll() is None)
         total_receivers = len(self.processes)
+
+        # Update heartbeats for all receivers
+        for dev_idx in self._receiver_info:
+            proc_idx = dev_idx if dev_idx < len(self.processes) else None
+            if proc_idx is not None and self.processes[proc_idx].poll() is None:
+                self._update_receiver(dev_idx)  # heartbeat only
+            elif proc_idx is not None:
+                self._update_receiver(dev_idx, status="error",
+                                      last_error=f"exited with code {self.processes[proc_idx].returncode}")
         r315 = self.stats.get("readings_315MHz", 0)
         r433 = self.stats.get("readings_433MHz", 0)
         est_v = max(1, self.stats["unique_sensors"] // 4) if self.stats["unique_sensors"] > 0 else 0

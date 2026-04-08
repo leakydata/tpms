@@ -93,6 +93,43 @@ def api_stats():
         db.close()
 
 
+@app.route("/api/receivers")
+def api_receivers():
+    db = get_db()
+    try:
+        # Check if receivers table exists
+        tables = [r[0] for r in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='receivers'"
+        ).fetchall()]
+        if "receivers" not in tables:
+            return jsonify({"receivers": [], "capture_running": False})
+
+        rows = db.execute("SELECT * FROM receivers ORDER BY device_index").fetchall()
+        receivers = []
+        capture_running = False
+        for r in rows:
+            rec = dict(r)
+            # Determine health based on heartbeat age
+            if rec["last_heartbeat"]:
+                try:
+                    hb = datetime.fromisoformat(rec["last_heartbeat"])
+                    age_secs = (datetime.now(timezone.utc) - hb.replace(tzinfo=timezone.utc)).total_seconds()
+                    rec["heartbeat_age_secs"] = round(age_secs)
+                    if rec["status"] == "running" and age_secs > 60:
+                        rec["status"] = "stale"
+                    if rec["status"] == "running":
+                        capture_running = True
+                except Exception:
+                    rec["heartbeat_age_secs"] = None
+            else:
+                rec["heartbeat_age_secs"] = None
+            receivers.append(rec)
+
+        return jsonify({"receivers": receivers, "capture_running": capture_running})
+    finally:
+        db.close()
+
+
 @app.route("/api/readings")
 def api_readings():
     db = get_db()
