@@ -10,7 +10,9 @@ Supports any number of RTL-SDR dongles (use a powered USB hub).
 For research on anti-stalking / vehicle tracking privacy.
 """
 
+import hashlib
 import json
+import re
 import sqlite3
 import subprocess
 import signal
@@ -185,13 +187,18 @@ def init_db():
         )
     """)
 
-    # Unknown / unrecognized signal detections
+    # Unknown / unrecognized signal detections with fingerprinting
     conn.execute("""
         CREATE TABLE IF NOT EXISTS unknown_signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
             device_index INTEGER,
             frequency_label TEXT,
+            pulse_count INTEGER,
+            width_ms REAL,
+            modulation TEXT,
+            raw_hex TEXT,
+            fingerprint TEXT,
             analysis_text TEXT,
             rssi REAL,
             noise REAL
@@ -202,6 +209,11 @@ def init_db():
     # SQLite doesn't error on duplicate ALTER ADD, so we catch and ignore.
     migrations = [
         "ALTER TABLE readings ADD COLUMN signal_id INTEGER REFERENCES signals(id)",
+        "ALTER TABLE unknown_signals ADD COLUMN pulse_count INTEGER",
+        "ALTER TABLE unknown_signals ADD COLUMN width_ms REAL",
+        "ALTER TABLE unknown_signals ADD COLUMN modulation TEXT",
+        "ALTER TABLE unknown_signals ADD COLUMN raw_hex TEXT",
+        "ALTER TABLE unknown_signals ADD COLUMN fingerprint TEXT",
     ]
     for sql in migrations:
         try:
