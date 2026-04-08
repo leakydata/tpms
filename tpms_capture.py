@@ -198,6 +198,7 @@ class SignalMonitor:
     # Rolling window of recent events for the activity timeline
     TIMELINE_WIDTH = 60  # characters wide
     TIMELINE_SECONDS = 300  # 5 minutes of history
+    DASHBOARD_LINES = 0   # set after first render, used for in-place redraw
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -226,6 +227,7 @@ class SignalMonitor:
         }
         self.recent_sensors = deque(maxlen=8)
         self.start_time = time.monotonic()
+        self._first_render = True
 
     def record_signal(self, freq_label, rssi, snr, noise, sensor_id, model):
         """Record a new signal reception event."""
