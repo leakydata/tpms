@@ -4,13 +4,14 @@
 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
     <div>
         <h1 style="font-size:1.5em">Unknown Signals</h1>
-        <p class="dim" style="margin-top:4px">Signals detected by the SDR but not decoded by any known protocol. These may be TPMS from unsupported vehicles, interference, or other RF sources.</p>
+        <p class="dim" style="margin-top:4px">Signals detected but not decoded by any known protocol. Fingerprints identify the protocol type; raw hex contains the actual bits (stable portion = sensor ID).</p>
     </div>
     <button type="button" onclick="loadUnknowns(currentPage)" style="background:var(--bg-card);border:1px solid var(--border);color:var(--cyan);padding:8px 16px;border-radius:6px;cursor:pointer;font-size:0.9em">Refresh</button>
 </div>
 
 <div class="stats-grid">
-    <div class="stat-card"><div class="label">Total Unknown</div><div class="value" id="stat-total" style="color:var(--orange)">-</div></div>
+    <div class="stat-card"><div class="label">Total Unknown</div><div class="value" id="stat-total" style="color:#d18616">-</div></div>
+    <div class="stat-card"><div class="label">Unique Fingerprints</div><div class="value" id="stat-fps" style="color:var(--cyan)">-</div></div>
 </div>
 
 <div class="card">
@@ -21,19 +22,46 @@
                     <th>ID</th>
                     <th>Timestamp</th>
                     <th>Band</th>
+                    <th>Fingerprint</th>
+                    <th>Modulation</th>
+                    <th>Pulses</th>
+                    <th>Width</th>
+                    <th>Raw Hex</th>
                     <th>Analysis</th>
                 </tr>
             </thead>
             <tbody id="unknowns-tbody">
-                <tr><td colspan="4" class="empty">Loading...</td></tr>
+                <tr><td colspan="9" class="empty">Loading...</td></tr>
             </tbody>
         </table>
     </div>
     <div class="pagination" id="pagination"></div>
 </div>
+
+<div id="analysis-detail"></div>
 {% endblock %}
 
 {% block scripts %}
+<style>
+    .fp-tag {
+        font-family: 'SF Mono', monospace;
+        font-size: 0.85em;
+        padding: 2px 6px;
+        border-radius: 4px;
+        background: rgba(88,166,255,0.12);
+        color: var(--cyan);
+        cursor: pointer;
+    }
+    .hex-cell {
+        max-width: 200px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-family: monospace;
+        font-size: 0.85em;
+        color: var(--text-dim);
+    }
+</style>
 <script>
 let currentPage = 1;
 
@@ -41,6 +69,28 @@ function truncate(text, maxLen) {
     if (!text) return '-';
     if (text.length <= maxLen) return text;
     return text.substring(0, maxLen) + '...';
+}
+
+function showAnalysis(id) {
+    fetch('/api/unknown?per_page=200')
+        .then(r => r.json())
+        .then(data => {
+            let u = data.unknowns.find(x => x.id === id);
+            if (!u) return;
+            let text = (u.analysis_text || '-').replace(/</g, '&lt;').replace(/\n/g, '<br>');
+            document.getElementById('analysis-detail').innerHTML = `
+                <div class="card" style="margin-top:16px">
+                    <h2>Analysis — Signal #${id}</h2>
+                    <p style="margin:8px 0"><span class="badge badge-cyan">${u.frequency_label || '?'}</span>
+                    Fingerprint: <span class="fp-tag">${u.fingerprint || '?'}</span>
+                    Modulation: <strong>${u.modulation || '?'}</strong>
+                    Pulses: <strong>${u.pulse_count || '?'}</strong>
+                    Width: <strong>${u.width_ms ? u.width_ms.toFixed(2) + ' ms' : '?'}</strong></p>
+                    ${u.raw_hex ? '<p style="margin:8px 0"><strong>Raw hex:</strong> <code class="mono" style="word-break:break-all;color:var(--green)">' + u.raw_hex + '</code></p>' : ''}
+                    <pre style="background:var(--bg);padding:12px;border-radius:6px;overflow-x:auto;font-size:0.85em;line-height:1.6;color:var(--text-dim);margin-top:12px">${text}</pre>
+                </div>`;
+            document.getElementById('analysis-detail').scrollIntoView({behavior: 'smooth'});
+        });
 }
 
 function loadUnknowns(page) {
@@ -52,31 +102,29 @@ function loadUnknowns(page) {
         .then(data => {
             document.getElementById('stat-total').textContent = data.total.toLocaleString();
 
+            // Count unique fingerprints
+            let fps = new Set(data.unknowns.map(u => u.fingerprint).filter(Boolean));
+            document.getElementById('stat-fps').textContent = fps.size;
+
             let html = '';
             for (let u of data.unknowns) {
-                let bandLabel = '-';
-                let bandClass = 'badge-cyan';
-                if (u.frequency_mhz) {
-                    if (u.frequency_mhz < 400) { bandLabel = '315'; bandClass = 'badge-green'; }
-                    else { bandLabel = '433'; bandClass = 'badge-cyan'; }
-                } else if (u.band) {
-                    bandLabel = u.band;
-                    bandClass = bandLabel.includes('315') ? 'badge-green' : 'badge-cyan';
-                }
+                let bandLabel = u.frequency_label || '-';
+                let bandClass = bandLabel.includes('315') ? 'badge-green' : 'badge-cyan';
 
-                let analysis = u.analysis || u.raw_data || u.description || '-';
-                let analysisShort = truncate(analysis, 100);
-
-                html += `<tr>
-                    <td class="mono dim">${u.id || '-'}</td>
+                html += `<tr onclick="showAnalysis(${u.id})" style="cursor:pointer">
+                    <td class="mono dim">${u.id}</td>
                     <td class="mono dim">${u.timestamp || '-'}</td>
                     <td><span class="badge ${bandClass}">${bandLabel}</span></td>
-                    <td title="${analysis.replace(/"/g, '&quot;')}">${analysisShort}</td>
+                    <td><span class="fp-tag">${u.fingerprint || '-'}</span></td>
+                    <td>${u.modulation || '-'}</td>
+                    <td>${u.pulse_count || '-'}</td>
+                    <td>${u.width_ms ? u.width_ms.toFixed(2) + ' ms' : '-'}</td>
+                    <td class="hex-cell" title="${(u.raw_hex || '').replace(/"/g, '&quot;')}">${u.raw_hex || '-'}</td>
+                    <td class="dim">${truncate(u.analysis_text, 60)}</td>
                 </tr>`;
             }
-            document.getElementById('unknowns-tbody').innerHTML = html || '<tr><td colspan="4" class="empty">No unknown signals recorded</td></tr>';
+            document.getElementById('unknowns-tbody').innerHTML = html || '<tr><td colspan="9" class="empty">No unknown signals recorded yet. Signals that can\'t be decoded by any known protocol will appear here.</td></tr>';
 
-            // Pagination
             let pag = '';
             if (data.pages > 0) {
                 pag += `<button onclick="loadUnknowns(${data.page - 1})" ${data.page <= 1 ? 'disabled' : ''}>Prev</button>`;

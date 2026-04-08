@@ -936,6 +936,11 @@ class TPMSCapture:
         log_info("Shutdown signal received")
         self.running = False
         self._flush_decode_buffer()
+        # Flush any buffered analysis blocks
+        for dev_idx in list(self._analysis_buffer.keys()):
+            buf = self._analysis_buffer.pop(dev_idx)
+            label = self._receiver_info.get(dev_idx, {}).get("label", "?")
+            self._store_unknown(dev_idx, label, buf)
 
         for proc in self.processes:
             if proc.poll() is None:
