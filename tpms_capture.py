@@ -18,7 +18,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
 
 DB_PATH = Path(__file__).parent / "tpms_data.db"
 
@@ -67,6 +67,12 @@ COLORS = {
     "magenta": "\033[35m",
     "cyan":    "\033[36m",
     "white":   "\033[37m",
+    "bg_red":     "\033[41m",
+    "bg_green":   "\033[42m",
+    "bg_yellow":  "\033[43m",
+    "bg_blue":    "\033[44m",
+    "bg_magenta": "\033[45m",
+    "bg_cyan":    "\033[46m",
 }
 
 # Disable colors if not a TTY
@@ -112,6 +118,268 @@ def log_sdr(msg):
 
 def log_stats(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['white']}{C['bold']}STAT{C['reset']}  {msg}", flush=True)
+
+
+# ── Signal level display ────────────────────────────────────────────────────
+
+# Block characters for signal bars (⅛ increments)
+BAR_CHARS = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"]
+
+
+def signal_bar(rssi_db, min_db=-30.0, max_db=0.0, width=30):
+    """Render an RSSI value as a colored bar.
+
+    rtl_433 RSSI typically ranges from about -30 dB (weak) to 0 dB (strong).
+    """
+    if rssi_db is None:
+        return f"{C['dim']}{'·' * width} no signal{C['reset']}"
+
+    # Clamp to range
+    clamped = max(min_db, min(max_db, rssi_db))
+    fraction = (clamped - min_db) / (max_db - min_db)
+
+    # How many full + partial blocks
+    total_eighths = int(fraction * width * 8)
+    full_blocks = total_eighths // 8
+    partial = total_eighths % 8
+    empty = width - full_blocks - (1 if partial else 0)
+
+    # Color based on strength
+    if fraction > 0.6:
+        color = C["green"]
+    elif fraction > 0.3:
+        color = C["yellow"]
+    else:
+        color = C["red"]
+
+    bar = color + "█" * full_blocks
+    if partial:
+        bar += BAR_CHARS[partial]
+    bar += C["dim"] + "·" * empty + C["reset"]
+
+    return bar
+
+
+def snr_bar(snr_db, width=20):
+    """Render an SNR value as a colored bar.
+
+    rtl_433 SNR is roughly 0-30+ dB.
+    """
+    if snr_db is None:
+        return f"{C['dim']}{'·' * width} no data{C['reset']}"
+
+    max_snr = 30.0
+    clamped = max(0.0, min(max_snr, snr_db))
+    fraction = clamped / max_snr
+
+    total_eighths = int(fraction * width * 8)
+    full_blocks = total_eighths // 8
+    partial = total_eighths % 8
+    empty = width - full_blocks - (1 if partial else 0)
+
+    if fraction > 0.5:
+        color = C["green"]
+    elif fraction > 0.25:
+        color = C["yellow"]
+    else:
+        color = C["red"]
+
+    bar = color + "█" * full_blocks
+    if partial:
+        bar += BAR_CHARS[partial]
+    bar += C["dim"] + "·" * empty + C["reset"]
+
+    return bar
+
+
+class SignalMonitor:
+    """Tracks and displays live RF signal activity from both receivers."""
+
+    # Rolling window of recent events for the activity timeline
+    TIMELINE_WIDTH = 60  # characters wide
+    TIMELINE_SECONDS = 300  # 5 minutes of history
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        # Per-band signal tracking
+        self.bands = {
+            "315MHz": {
+                "last_rssi": None,
+                "last_snr": None,
+                "last_noise": None,
+                "peak_rssi": None,
+                "min_noise": None,
+                "readings": 0,
+                "last_activity": 0.0,
+                "timeline": deque(maxlen=self.TIMELINE_WIDTH),
+            },
+            "433MHz": {
+                "last_rssi": None,
+                "last_snr": None,
+                "last_noise": None,
+                "peak_rssi": None,
+                "min_noise": None,
+                "readings": 0,
+                "last_activity": 0.0,
+                "timeline": deque(maxlen=self.TIMELINE_WIDTH),
+            },
+        }
+        self.recent_sensors = deque(maxlen=8)
+        self.start_time = time.monotonic()
+
+    def record_signal(self, freq_label, rssi, snr, noise, sensor_id, model):
+        """Record a new signal reception event."""
+        now = time.monotonic()
+        with self.lock:
+            band = self.bands.get(freq_label)
+            if not band:
+                return
+            band["last_rssi"] = rssi
+            band["last_snr"] = snr
+            band["last_noise"] = noise
+            band["readings"] += 1
+            band["last_activity"] = now
+
+            if rssi is not None:
+                if band["peak_rssi"] is None or rssi > band["peak_rssi"]:
+                    band["peak_rssi"] = rssi
+            if noise is not None:
+                if band["min_noise"] is None or noise < band["min_noise"]:
+                    band["min_noise"] = noise
+
+            # Timeline: record this moment
+            band["timeline"].append((now, rssi or -25.0))
+
+            self.recent_sensors.append((now, freq_label, sensor_id[:10], model))
+
+    def _render_timeline(self, band_data):
+        """Render the activity timeline as a sparkline.
+
+        Each character position represents a time bucket. If a signal was
+        received in that bucket, show a block proportional to RSSI.
+        """
+        now = time.monotonic()
+        timeline = band_data["timeline"]
+        if not timeline:
+            return C["dim"] + "·" * self.TIMELINE_WIDTH + C["reset"]
+
+        # Divide the window into buckets
+        bucket_seconds = self.TIMELINE_SECONDS / self.TIMELINE_WIDTH
+        buckets = [None] * self.TIMELINE_WIDTH
+
+        for t, rssi in timeline:
+            age = now - t
+            if age > self.TIMELINE_SECONDS:
+                continue
+            idx = self.TIMELINE_WIDTH - 1 - int(age / bucket_seconds)
+            idx = max(0, min(self.TIMELINE_WIDTH - 1, idx))
+            if buckets[idx] is None or rssi > buckets[idx]:
+                buckets[idx] = rssi
+
+        # Render
+        spark_chars = " ▁▂▃▄▅▆▇█"
+        min_r, max_r = -30.0, 0.0
+        result = ""
+        for val in buckets:
+            if val is None:
+                result += C["dim"] + "·"
+            else:
+                frac = max(0.0, min(1.0, (val - min_r) / (max_r - min_r)))
+                idx = int(frac * (len(spark_chars) - 1))
+                if frac > 0.6:
+                    result += C["green"]
+                elif frac > 0.3:
+                    result += C["yellow"]
+                else:
+                    result += C["red"]
+                result += spark_chars[idx]
+        result += C["reset"]
+        return result
+
+    def render_display(self, total_readings, unique_sensors, uptime_secs):
+        """Render the full signal monitor display."""
+        mins = int(uptime_secs // 60)
+        secs = int(uptime_secs % 60)
+        now = time.monotonic()
+
+        lines = []
+        lines.append("")
+        lines.append(f"  {C['bold']}{C['cyan']}┌─ Signal Monitor ─────────────────────────────────────────────────────────────┐{C['reset']}")
+
+        for label in ("315MHz", "433MHz"):
+            band = self.bands[label]
+            age = now - band["last_activity"] if band["last_activity"] > 0 else float("inf")
+
+            # Activity indicator
+            if age < 2:
+                dot = f"{C['green']}●{C['reset']}"
+            elif age < 30:
+                dot = f"{C['yellow']}●{C['reset']}"
+            else:
+                dot = f"{C['dim']}○{C['reset']}"
+
+            # Signal bars
+            rssi_str = f"{band['last_rssi']:+6.1f}dB" if band['last_rssi'] is not None else "  ----  "
+            snr_str = f"{band['last_snr']:5.1f}dB" if band['last_snr'] is not None else " ---- "
+            noise_str = f"{band['last_noise']:+6.1f}dB" if band['last_noise'] is not None else "  ----  "
+
+            rbar = signal_bar(band["last_rssi"], width=20)
+            sbar = snr_bar(band["last_snr"], width=15)
+
+            lines.append(
+                f"  {C['bold']}{C['cyan']}│{C['reset']}  {dot} {C['bold']}{label}{C['reset']}"
+                f"  RSSI:{rssi_str} {rbar}"
+                f"  SNR:{snr_str} {sbar}"
+                f"  noise:{noise_str}"
+            )
+
+            # Timeline (5-minute activity sparkline)
+            tl = self._render_timeline(band)
+            lines.append(
+                f"  {C['bold']}{C['cyan']}│{C['reset']}          "
+                f"{C['dim']}5m ago{C['reset']} {tl} {C['dim']}now{C['reset']}"
+            )
+
+            # Peak stats
+            peak_str = f"{band['peak_rssi']:+.1f}dB" if band["peak_rssi"] is not None else "n/a"
+            lines.append(
+                f"  {C['bold']}{C['cyan']}│{C['reset']}          "
+                f"{C['dim']}readings: {band['readings']}  peak RSSI: {peak_str}{C['reset']}"
+            )
+            lines.append(f"  {C['bold']}{C['cyan']}│{C['reset']}")
+
+        # Recent sensors
+        lines.append(f"  {C['bold']}{C['cyan']}│{C['reset']}  {C['bold']}Recent sensors:{C['reset']}")
+        if self.recent_sensors:
+            for t, freq, sid, model in reversed(self.recent_sensors):
+                age = now - t
+                if age < 5:
+                    age_str = f"{C['green']}{age:.0f}s ago{C['reset']}"
+                elif age < 60:
+                    age_str = f"{C['yellow']}{age:.0f}s ago{C['reset']}"
+                else:
+                    age_str = f"{C['dim']}{age/60:.0f}m ago{C['reset']}"
+                lines.append(
+                    f"  {C['bold']}{C['cyan']}│{C['reset']}    "
+                    f"{age_str:>22}  [{freq}]  {C['cyan']}{sid:<12}{C['reset']}  {model}"
+                )
+        else:
+            lines.append(f"  {C['bold']}{C['cyan']}│{C['reset']}    {C['dim']}waiting for first signal...{C['reset']}")
+
+        # Footer stats
+        est_v = max(1, unique_sensors // 4) if unique_sensors > 0 else 0
+        lines.append(f"  {C['bold']}{C['cyan']}│{C['reset']}")
+        lines.append(
+            f"  {C['bold']}{C['cyan']}│{C['reset']}  "
+            f"{C['bold']}uptime:{C['reset']} {mins:02d}:{secs:02d}  "
+            f"{C['bold']}readings:{C['reset']} {total_readings}  "
+            f"{C['bold']}unique sensors:{C['reset']} {unique_sensors}  "
+            f"{C['bold']}est vehicles:{C['reset']} ~{est_v}"
+        )
+        lines.append(f"  {C['bold']}{C['cyan']}└──────────────────────────────────────────────────────────────────────────────┘{C['reset']}")
+        lines.append("")
+
+        return "\n".join(lines)
 
 
 # ── Database ─────────────────────────────────────────────────────────────────
@@ -242,6 +510,7 @@ class TPMSCapture:
         self.start_time = datetime.now(timezone.utc)
         self.last_status_time = time.monotonic()
         self.stderr_threads = []
+        self.signal_monitor = SignalMonitor()
 
     def build_rtl433_cmd(self, device_index: int, frequency: float) -> list:
         """Build rtl_433 command for a specific device and frequency."""
@@ -337,6 +606,11 @@ class TPMSCapture:
             self.sensor_models[fields["sensor_id"]] = model
             self.sensor_last_seen[fields["sensor_id"]] = timestamp
 
+        # Record in signal monitor
+        self.signal_monitor.record_signal(
+            freq_label, rssi, snr, noise, fields["sensor_id"], model
+        )
+
         # ── Build detailed log line ──
         sid = fields["sensor_id"]
         psi_str = ""
@@ -352,12 +626,12 @@ class TPMSCapture:
         if fields["flags"]:
             flag_str = f"  flags={fields['flags']}"
         signal_str = ""
-        if snr is not None:
-            signal_str += f"  SNR={snr:.1f}dB"
         if rssi is not None:
-            signal_str += f"  RSSI={rssi:.1f}dB"
+            signal_str += f"  RSSI:{rssi:+.1f}dB {signal_bar(rssi, width=10)}"
+        if snr is not None:
+            signal_str += f"  SNR:{snr:.1f}dB"
         if noise is not None:
-            signal_str += f"  noise={noise:.1f}dB"
+            signal_str += f"  noise:{noise:+.1f}dB"
         freq_str = f"  freq={freq_mhz:.3f}MHz" if freq_mhz else ""
 
         new_tag = f"  {C['yellow']}** NEW SENSOR **{C['reset']}" if is_new_sensor else ""
@@ -423,23 +697,14 @@ class TPMSCapture:
             log_warn(f"[{freq_label}] Receiver stopped unexpectedly")
 
     def print_periodic_status(self):
-        """Print a status line every 30 seconds showing we're alive."""
+        """Print the signal monitor dashboard every 10 seconds."""
         elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
-        mins = int(elapsed // 60)
-        secs = int(elapsed % 60)
-
-        alive_procs = sum(1 for p in self.processes if p.poll() is None)
-        readings_315 = self.stats.get("readings_315MHz", 0)
-        readings_433 = self.stats.get("readings_433MHz", 0)
-
-        log_stats(
-            f"uptime={mins:02d}:{secs:02d}  "
-            f"receivers={alive_procs}/2  "
-            f"readings={self.stats['total_readings']} "
-            f"(315MHz:{readings_315} 433MHz:{readings_433})  "
-            f"unique_sensors={self.stats['unique_sensors']}  "
-            f"est_vehicles=~{max(1, self.stats['unique_sensors'] // 4) if self.stats['unique_sensors'] > 0 else 0}"
+        display = self.signal_monitor.render_display(
+            self.stats["total_readings"],
+            self.stats["unique_sensors"],
+            elapsed,
         )
+        print(display, flush=True)
 
     def correlate_vehicles(self):
         """Group sensor IDs that appear within short time windows into vehicles."""
@@ -617,7 +882,7 @@ class TPMSCapture:
         log_info(f"Monitoring {len(TPMS_PROTOCOLS)} TPMS protocols")
         log_info(f"Device 0 (E4000):  315.000 MHz (North America)")
         log_info(f"Device 1 (R820T):  433.920 MHz (Europe/aftermarket)")
-        log_info(f"Status updates every 30 seconds")
+        log_info(f"Signal monitor updates every 10 seconds")
         log_info(f"Press Ctrl+C to stop and see summary")
         print()
 
@@ -641,12 +906,12 @@ class TPMSCapture:
         log_ok("433 MHz receiver thread started")
         print()
 
-        # Main loop: periodic status + keep-alive
+        # Main loop: periodic signal monitor display
         try:
             while self.running:
                 time.sleep(1)
                 now = time.monotonic()
-                if now - self.last_status_time >= 30:
+                if now - self.last_status_time >= 10:
                     self.print_periodic_status()
                     self.last_status_time = now
 
