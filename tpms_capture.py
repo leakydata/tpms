@@ -648,6 +648,12 @@ class TPMSCapture:
         for data, fields, freq_label in non_tpms:
             self._store_signal(data, freq_label)
 
+        # Filter out obvious false decodes (absurd temperature)
+        tpms_decodes = [
+            (d, f, fl) for d, f, fl in tpms_decodes
+            if f["temperature_c"] is None or -20 <= f["temperature_c"] <= 80
+        ]
+
         if len(tpms_decodes) == 0:
             pass
         elif len(tpms_decodes) == 1:
