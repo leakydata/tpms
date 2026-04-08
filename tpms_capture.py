@@ -397,18 +397,25 @@ class TPMSCapture:
 
             # Detect pulse analysis blocks from -A flag (unknown signals)
             if line.startswith("Analyzing pulses") and device_index not in self._analysis_buffer:
-                # Start of new analysis block
+                # Start of new analysis block — buffer silently
                 self._analysis_buffer[device_index] = [line]
-                log_info(f"[{freq_label}] {C['yellow']}UNKNOWN{C['reset']}  Signal detected — analyzing...")
                 continue
             elif device_index in self._analysis_buffer:
                 if self._is_analysis_line(lower):
                     self._analysis_buffer[device_index].append(line)
                     continue
                 else:
-                    # Non-analysis line = end of block
+                    # End of analysis block — check pulse count before storing
                     buf = self._analysis_buffer.pop(device_index)
-                    self._store_unknown(device_index, freq_label, buf)
+                    # Quick check: extract pulse count from the 2nd line
+                    store = True
+                    if len(buf) >= 2:
+                        m = re.search(r"Total count:\s*(\d+)", buf[1])
+                        if m and int(m.group(1)) < 30:
+                            self.stats["unknown_filtered"] += 1
+                            store = False
+                    if store:
+                        self._store_unknown(device_index, freq_label, buf)
                     # Fall through to classify this line normally
 
             # Capture tuner info for receiver status
@@ -926,7 +933,10 @@ class TPMSCapture:
         groups, current_group, current_time = [], [], None
         for sid, first_seen, last_seen, count, model in sensors:
             t = datetime.fromisoformat(first_seen)
-            if current_time is None or (t - current_time).total_seconds() < 30:
+            # At 40-50 mph, a vehicle passes a ~200ft antenna range in ~3-4 seconds.
+            # TPMS sensors transmit every ~1s when moving. Use a 5-second window
+            # to group sensors from the same vehicle without merging consecutive cars.
+            if current_time is None or (t - current_time).total_seconds() < 5:
                 current_group.append((sid, first_seen, last_seen, count, model))
                 if current_time is None:
                     current_time = t
