@@ -47,6 +47,11 @@ def signals_page():
     return render_template("signals.html")
 
 
+@app.route("/unknown")
+def unknown_page():
+    return render_template("unknown.html")
+
+
 # ── API endpoints ────────────────────────────────────────────────────────────
 
 @app.route("/api/stats")

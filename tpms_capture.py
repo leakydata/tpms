@@ -185,6 +185,19 @@ def init_db():
         )
     """)
 
+    # Unknown / unrecognized signal detections
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS unknown_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            device_index INTEGER,
+            frequency_label TEXT,
+            analysis_text TEXT,
+            rssi REAL,
+            noise REAL
+        )
+    """)
+
     # ── Auto-migrate: add columns that may be missing from older databases ──
     # SQLite doesn't error on duplicate ALTER ADD, so we catch and ignore.
     migrations = [
@@ -207,6 +220,7 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_sensor_id ON readings(sensor_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_timestamp ON readings(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_vehicles_hash ON vehicles(vehicle_hash)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_unknown_timestamp ON unknown_signals(timestamp)")
     conn.commit()
 
     cur = conn.execute("SELECT COUNT(*) FROM signals")
@@ -314,20 +328,30 @@ class TPMSCapture:
         self._decode_buffer_key = None
         self._decode_flush_timer = None
         self._receiver_info = {}  # device_index -> {label, freq, pid, status, ...}
+        self._analysis_buffer = {}  # device_index -> list of lines
 
     def build_rtl433_cmd(self, device_index: int, frequency: int) -> list:
         protocol_args = []
         for p in DISABLED_BY_DEFAULT:
             protocol_args.extend(["-R", str(p)])
-        return [
+        cmd = [
             "rtl_433",
             "-d", str(device_index),
             "-f", str(frequency),
             "-M", "time:utc",
             "-M", "protocol",
             "-M", "level",
+            "-A",
             "-F", "json",
         ] + protocol_args
+
+        # Load custom flex decoders
+        flex_dir = Path(__file__).parent / "flex_decoders"
+        if flex_dir.is_dir():
+            for conf in sorted(flex_dir.glob("*.conf")):
+                cmd.extend(["-c", str(conf)])
+
+        return cmd
 
     def _stream_stderr(self, proc, freq_label: str, device_index: int):
         for line in proc.stderr:
@@ -335,6 +359,21 @@ class TPMSCapture:
             if not line:
                 continue
             lower = line.lower()
+
+            # Detect pulse analysis blocks from -A flag (unknown signals)
+            if line.startswith("Analyzing") or "pulse_demod" in lower:
+                if device_index not in self._analysis_buffer:
+                    self._analysis_buffer[device_index] = []
+                self._analysis_buffer[device_index].append(line)
+                log_info(f"[{freq_label}] {C['yellow']}UNKNOWN{C['reset']}  {line}")
+                continue
+            elif device_index in self._analysis_buffer:
+                # End of analysis block — store it
+                buf = self._analysis_buffer.pop(device_index)
+                buf.append(line)
+                self._store_unknown(device_index, freq_label, "\n".join(buf))
+                log_info(f"[{freq_label}] {C['yellow']}UNKNOWN{C['reset']}  Stored unknown signal analysis ({len(buf)} lines)")
+                continue
 
             # Capture tuner info for receiver status
             if "found" in lower and "tuner" in lower:
