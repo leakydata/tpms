@@ -13,12 +13,11 @@ import subprocess
 import signal
 import shutil
 import sys
-import os
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import defaultdict, deque
+from collections import defaultdict
 
 DB_PATH = Path(__file__).parent / "tpms_data.db"
 
@@ -56,7 +55,7 @@ TPMS_PROTOCOLS = {
 }
 
 # Protocols that are disabled by default in rtl_433 and must be explicitly
-# enabled with -R.  We enable all of these that might carry TPMS data.
+# enabled with -R.
 DISABLED_BY_DEFAULT = [
     6, 7, 13, 14, 24, 37, 48, 61, 62, 64, 72, 86, 101, 106, 107,
     117, 118, 123, 129, 150, 162, 169, 198, 200, 216, 233, 242, 245,
@@ -76,342 +75,45 @@ COLORS = {
     "magenta": "\033[35m",
     "cyan":    "\033[36m",
     "white":   "\033[37m",
-    "bg_red":     "\033[41m",
-    "bg_green":   "\033[42m",
-    "bg_yellow":  "\033[43m",
-    "bg_blue":    "\033[44m",
-    "bg_magenta": "\033[45m",
-    "bg_cyan":    "\033[46m",
 }
 
-# Disable colors if not a TTY
 if not sys.stdout.isatty():
     COLORS = {k: "" for k in COLORS}
 
-C = COLORS  # short alias
+C = COLORS
 
 
 def _ts():
-    """Return a formatted timestamp for log lines."""
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
-
 
 def log_info(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['cyan']}INFO{C['reset']}  {msg}", flush=True)
 
-
 def log_ok(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['green']}  OK{C['reset']}  {msg}", flush=True)
-
 
 def log_warn(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['yellow']}WARN{C['reset']}  {msg}", flush=True)
 
-
 def log_error(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['red']}ERROR{C['reset']} {msg}", flush=True)
 
-
 def log_rx(msg):
-    """Log a received TPMS reading."""
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['green']}  RX{C['reset']}  {msg}", flush=True)
-
 
 def log_db(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['magenta']}  DB{C['reset']}  {msg}", flush=True)
 
-
 def log_sdr(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['blue']} SDR{C['reset']}  {msg}", flush=True)
-
 
 def log_stats(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['white']}{C['bold']}STAT{C['reset']}  {msg}", flush=True)
 
 
-# ── Signal level display ────────────────────────────────────────────────────
-
-# Block characters for signal bars (⅛ increments)
-BAR_CHARS = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉", "█"]
-
-
-def signal_bar(rssi_db, min_db=-30.0, max_db=0.0, width=30):
-    """Render an RSSI value as a colored bar.
-
-    rtl_433 RSSI typically ranges from about -30 dB (weak) to 0 dB (strong).
-    """
-    if rssi_db is None:
-        return f"{C['dim']}{'·' * width} no signal{C['reset']}"
-
-    # Clamp to range
-    clamped = max(min_db, min(max_db, rssi_db))
-    fraction = (clamped - min_db) / (max_db - min_db)
-
-    # How many full + partial blocks
-    total_eighths = int(fraction * width * 8)
-    full_blocks = total_eighths // 8
-    partial = total_eighths % 8
-    empty = width - full_blocks - (1 if partial else 0)
-
-    # Color based on strength
-    if fraction > 0.6:
-        color = C["green"]
-    elif fraction > 0.3:
-        color = C["yellow"]
-    else:
-        color = C["red"]
-
-    bar = color + "█" * full_blocks
-    if partial:
-        bar += BAR_CHARS[partial]
-    bar += C["dim"] + "·" * empty + C["reset"]
-
-    return bar
-
-
-def snr_bar(snr_db, width=20):
-    """Render an SNR value as a colored bar.
-
-    rtl_433 SNR is roughly 0-30+ dB.
-    """
-    if snr_db is None:
-        return f"{C['dim']}{'·' * width} no data{C['reset']}"
-
-    max_snr = 30.0
-    clamped = max(0.0, min(max_snr, snr_db))
-    fraction = clamped / max_snr
-
-    total_eighths = int(fraction * width * 8)
-    full_blocks = total_eighths // 8
-    partial = total_eighths % 8
-    empty = width - full_blocks - (1 if partial else 0)
-
-    if fraction > 0.5:
-        color = C["green"]
-    elif fraction > 0.25:
-        color = C["yellow"]
-    else:
-        color = C["red"]
-
-    bar = color + "█" * full_blocks
-    if partial:
-        bar += BAR_CHARS[partial]
-    bar += C["dim"] + "·" * empty + C["reset"]
-
-    return bar
-
-
-class SignalMonitor:
-    """Tracks and displays live RF signal activity from both receivers."""
-
-    # Rolling window of recent events for the activity timeline
-    TIMELINE_WIDTH = 60  # characters wide
-    TIMELINE_SECONDS = 300  # 5 minutes of history
-    DASHBOARD_LINES = 0   # set after first render, used for in-place redraw
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        # Per-band signal tracking
-        self.bands = {
-            "315MHz": {
-                "last_rssi": None,
-                "last_snr": None,
-                "last_noise": None,
-                "peak_rssi": None,
-                "min_noise": None,
-                "readings": 0,
-                "last_activity": 0.0,
-                "timeline": deque(maxlen=self.TIMELINE_WIDTH),
-            },
-            "433MHz": {
-                "last_rssi": None,
-                "last_snr": None,
-                "last_noise": None,
-                "peak_rssi": None,
-                "min_noise": None,
-                "readings": 0,
-                "last_activity": 0.0,
-                "timeline": deque(maxlen=self.TIMELINE_WIDTH),
-            },
-        }
-        self.recent_sensors = deque(maxlen=8)
-        self.start_time = time.monotonic()
-        self._first_render = True
-
-    def record_signal(self, freq_label, rssi, snr, noise, sensor_id, model):
-        """Record a new signal reception event."""
-        now = time.monotonic()
-        with self.lock:
-            band = self.bands.get(freq_label)
-            if not band:
-                return
-            band["last_rssi"] = rssi
-            band["last_snr"] = snr
-            band["last_noise"] = noise
-            band["readings"] += 1
-            band["last_activity"] = now
-
-            if rssi is not None:
-                if band["peak_rssi"] is None or rssi > band["peak_rssi"]:
-                    band["peak_rssi"] = rssi
-            if noise is not None:
-                if band["min_noise"] is None or noise < band["min_noise"]:
-                    band["min_noise"] = noise
-
-            # Timeline: record this moment
-            band["timeline"].append((now, rssi or -25.0))
-
-            self.recent_sensors.append((now, freq_label, sensor_id[:10], model))
-
-    def _render_timeline(self, band_data):
-        """Render the activity timeline as a sparkline.
-
-        Each character position represents a time bucket. If a signal was
-        received in that bucket, show a block proportional to RSSI.
-        """
-        now = time.monotonic()
-        timeline = band_data["timeline"]
-        if not timeline:
-            return C["dim"] + "·" * self.TIMELINE_WIDTH + C["reset"]
-
-        # Divide the window into buckets
-        bucket_seconds = self.TIMELINE_SECONDS / self.TIMELINE_WIDTH
-        buckets = [None] * self.TIMELINE_WIDTH
-
-        for t, rssi in timeline:
-            age = now - t
-            if age > self.TIMELINE_SECONDS:
-                continue
-            idx = self.TIMELINE_WIDTH - 1 - int(age / bucket_seconds)
-            idx = max(0, min(self.TIMELINE_WIDTH - 1, idx))
-            if buckets[idx] is None or rssi > buckets[idx]:
-                buckets[idx] = rssi
-
-        # Render
-        spark_chars = " ▁▂▃▄▅▆▇█"
-        min_r, max_r = -30.0, 0.0
-        result = ""
-        for val in buckets:
-            if val is None:
-                result += C["dim"] + "·"
-            else:
-                frac = max(0.0, min(1.0, (val - min_r) / (max_r - min_r)))
-                idx = int(frac * (len(spark_chars) - 1))
-                if frac > 0.6:
-                    result += C["green"]
-                elif frac > 0.3:
-                    result += C["yellow"]
-                else:
-                    result += C["red"]
-                result += spark_chars[idx]
-        result += C["reset"]
-        return result
-
-    def render_display(self, total_readings, unique_sensors, uptime_secs, pending_log_lines=0):
-        """Render the full signal monitor display.
-
-        If this is not the first render, prepend ANSI cursor-up codes to
-        overwrite the previous dashboard in-place.  If log lines were printed
-        between renders, we skip the overwrite and just print fresh.
-        """
-        mins = int(uptime_secs // 60)
-        secs = int(uptime_secs % 60)
-        now = time.monotonic()
-
-        lines = []
-        lines.append(f"  {C['bold']}{C['cyan']}┌─ Signal Monitor ─────────────────────────────────────────────────────────────┐{C['reset']}")
-
-        for label in ("315MHz", "433MHz"):
-            band = self.bands[label]
-            age = now - band["last_activity"] if band["last_activity"] > 0 else float("inf")
-
-            # Activity indicator
-            if age < 2:
-                dot = f"{C['green']}●{C['reset']}"
-            elif age < 30:
-                dot = f"{C['yellow']}●{C['reset']}"
-            else:
-                dot = f"{C['dim']}○{C['reset']}"
-
-            # Signal bars
-            rssi_str = f"{band['last_rssi']:+6.1f}dB" if band['last_rssi'] is not None else "  ----  "
-            snr_str = f"{band['last_snr']:5.1f}dB" if band['last_snr'] is not None else " ---- "
-            noise_str = f"{band['last_noise']:+6.1f}dB" if band['last_noise'] is not None else "  ----  "
-
-            rbar = signal_bar(band["last_rssi"], width=20)
-            sbar = snr_bar(band["last_snr"], width=15)
-
-            lines.append(
-                f"  {C['bold']}{C['cyan']}│{C['reset']}  {dot} {C['bold']}{label}{C['reset']}"
-                f"  RSSI:{rssi_str} {rbar}"
-                f"  SNR:{snr_str} {sbar}"
-                f"  noise:{noise_str}"
-            )
-
-            # Timeline (5-minute activity sparkline)
-            tl = self._render_timeline(band)
-            lines.append(
-                f"  {C['bold']}{C['cyan']}│{C['reset']}          "
-                f"{C['dim']}5m ago{C['reset']} {tl} {C['dim']}now{C['reset']}"
-            )
-
-            # Peak stats
-            peak_str = f"{band['peak_rssi']:+.1f}dB" if band["peak_rssi"] is not None else "n/a"
-            lines.append(
-                f"  {C['bold']}{C['cyan']}│{C['reset']}          "
-                f"{C['dim']}readings: {band['readings']}  peak RSSI: {peak_str}{C['reset']}"
-            )
-            lines.append(f"  {C['bold']}{C['cyan']}│{C['reset']}")
-
-        # Recent sensors
-        lines.append(f"  {C['bold']}{C['cyan']}│{C['reset']}  {C['bold']}Recent sensors:{C['reset']}")
-        if self.recent_sensors:
-            for t, freq, sid, model in reversed(self.recent_sensors):
-                age = now - t
-                if age < 5:
-                    age_str = f"{C['green']}{age:.0f}s ago{C['reset']}"
-                elif age < 60:
-                    age_str = f"{C['yellow']}{age:.0f}s ago{C['reset']}"
-                else:
-                    age_str = f"{C['dim']}{age/60:.0f}m ago{C['reset']}"
-                lines.append(
-                    f"  {C['bold']}{C['cyan']}│{C['reset']}    "
-                    f"{age_str:>22}  [{freq}]  {C['cyan']}{sid:<12}{C['reset']}  {model}"
-                )
-        else:
-            lines.append(f"  {C['bold']}{C['cyan']}│{C['reset']}    {C['dim']}waiting for first signal...{C['reset']}")
-
-        # Footer stats
-        est_v = max(1, unique_sensors // 4) if unique_sensors > 0 else 0
-        lines.append(f"  {C['bold']}{C['cyan']}│{C['reset']}")
-        lines.append(
-            f"  {C['bold']}{C['cyan']}│{C['reset']}  "
-            f"{C['bold']}uptime:{C['reset']} {mins:02d}:{secs:02d}  "
-            f"{C['bold']}readings:{C['reset']} {total_readings}  "
-            f"{C['bold']}unique sensors:{C['reset']} {unique_sensors}  "
-            f"{C['bold']}est vehicles:{C['reset']} ~{est_v}"
-        )
-        lines.append(f"  {C['bold']}{C['cyan']}└──────────────────────────────────────────────────────────────────────────────┘{C['reset']}")
-
-        n_lines = len(lines)
-
-        # If log lines were printed since last render, we can't overwrite —
-        # just print fresh.  Otherwise, move cursor up to overwrite in-place.
-        prefix = ""
-        if not self._first_render and pending_log_lines == 0 and self.DASHBOARD_LINES > 0:
-            # Move cursor up N lines + clear each line as we redraw
-            prefix = f"\033[{self.DASHBOARD_LINES}A"
-
-        self.DASHBOARD_LINES = n_lines
-        self._first_render = False
-
-        return prefix + "\n".join(f"\033[2K{l}" for l in lines)
-
-
 # ── Database ─────────────────────────────────────────────────────────────────
 
 def init_db():
-    """Create the SQLite database and tables."""
     log_db(f"Opening database: {DB_PATH}")
     conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -448,7 +150,6 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_vehicles_hash ON vehicles(vehicle_hash)")
     conn.commit()
 
-    # Report existing data
     cur = conn.execute("SELECT COUNT(*) FROM readings")
     existing = cur.fetchone()[0]
     cur = conn.execute("SELECT COUNT(DISTINCT sensor_id) FROM readings")
@@ -464,7 +165,6 @@ def init_db():
 # ── Field extraction ─────────────────────────────────────────────────────────
 
 def extract_sensor_fields(data: dict) -> dict:
-    """Extract relevant TPMS fields from an rtl_433 JSON message."""
     sensor_id = str(
         data.get("id")
         or data.get("ID")
@@ -511,28 +211,17 @@ def extract_sensor_fields(data: dict) -> dict:
 
 
 def is_tpms(data: dict) -> bool:
-    """Check if a decoded message is a TPMS reading.
-
-    Uses three detection methods to maximize coverage:
-    1. The "type" field — rtl_433 sets this to "TPMS" for known tire sensors
-    2. Model name keywords — catches decoders not using the type field
-    3. Known protocol numbers — hardcoded fallback list
-    """
-    # Method 1: explicit type field (most reliable)
+    """Check if a decoded message is a TPMS reading."""
     if data.get("type", "").upper() == "TPMS":
         return True
-    # Method 2: model name keywords
     model = data.get("model", "").lower()
     if any(kw in model for kw in ("tpms", "tire", "tyre", "schrader", "pmv-107",
                                    "steelmate", "jansite", "eez", "tyreguard")):
         return True
-    # Method 3: known protocol number
     proto = data.get("protocol")
     if proto is not None and int(proto) in TPMS_PROTOCOLS:
         return True
-    # Method 4: has pressure_kPa or pressure_PSI field (heuristic for unknown protocols)
     if "pressure_kPa" in data or "pressure_PSI" in data or "pressure_bar" in data:
-        # Could be a weather station — check it also has an ID but no humidity
         if ("id" in data or "ID" in data) and "humidity" not in data:
             return True
     return False
@@ -548,32 +237,22 @@ class TPMSCapture:
         self.lock = threading.Lock()
         self.stats = defaultdict(int)
         self.unique_sensors = set()
-        self.sensor_models = {}          # sensor_id -> model
-        self.sensor_last_seen = {}       # sensor_id -> timestamp
+        self.sensor_models = {}
+        self.sensor_last_seen = {}
         self.start_time = datetime.now(timezone.utc)
         self.last_status_time = time.monotonic()
         self.stderr_threads = []
-        self.signal_monitor = SignalMonitor()
-        self.log_lines_since_dashboard = 0  # tracks lines printed between dashboard redraws
         # Duplicate detection: buffer decodes that share timestamp+RSSI
-        self._decode_buffer = []       # list of (data_dict, fields, freq_label)
-        self._decode_buffer_key = None # (timestamp, rssi) of current burst
+        self._decode_buffer = []
+        self._decode_buffer_key = None
         self._decode_flush_timer = None
 
     def build_rtl433_cmd(self, device_index: int, frequency: float) -> list:
-        """Build rtl_433 command for a specific device and frequency.
-
-        Enables ALL protocols (including disabled-by-default ones) so we
-        catch every possible TPMS signal. Python-side filtering in is_tpms()
-        keeps only TPMS data. This future-proofs against new decoders added
-        to rtl_433 that we haven't listed yet.
-        """
-        # Enable disabled-by-default protocols
         protocol_args = []
         for p in DISABLED_BY_DEFAULT:
             protocol_args.extend(["-R", str(p)])
 
-        cmd = [
+        return [
             "rtl_433",
             "-d", str(device_index),
             "-f", str(int(frequency)),
@@ -583,18 +262,13 @@ class TPMSCapture:
             "-F", "json",
         ] + protocol_args
 
-        return cmd
-
     def _stream_stderr(self, proc, freq_label: str):
-        """Read and log stderr from an rtl_433 process."""
         for line in proc.stderr:
             line = line.strip()
             if not line:
                 continue
-            # Classify rtl_433 stderr messages
             lower = line.lower()
             if "if you want" in lower:
-                # Informational hint from rtl_433, not an actual error
                 log_sdr(f"[{freq_label}] {line}")
             elif "error" in lower or "fail" in lower:
                 log_error(f"[{freq_label}] {line}")
@@ -606,18 +280,15 @@ class TPMSCapture:
                 log_sdr(f"[{freq_label}] {line}")
 
     def _score_decode(self, fields):
-        """Score a decode's plausibility. Higher = more likely to be real."""
         score = 0
         temp = fields["temperature_c"]
         if temp is not None:
-            # Sane tire temperature: -10C to 80C
             if -10 <= temp <= 80:
                 score += 10
             else:
-                score -= 20  # absurd temp = likely false decode
+                score -= 20
         pres = fields["pressure_kpa"]
         if pres is not None:
-            # Sane tire pressure: 100-400 kPa (14-58 psi)
             if 100 <= pres <= 400:
                 score += 5
             else:
@@ -625,7 +296,6 @@ class TPMSCapture:
         return score
 
     def _flush_decode_buffer(self):
-        """Flush buffered decodes, keeping only the best per-burst."""
         if not self._decode_buffer:
             return
 
@@ -634,27 +304,17 @@ class TPMSCapture:
         self._decode_buffer_key = None
 
         if len(buf) == 1:
-            # Single decode, no dedup needed
             self._commit_decode(*buf[0])
         else:
-            # Multiple protocols decoded the same burst — pick the best
             scored = [(self._score_decode(fields), data, fields, fl) for data, fields, fl in buf]
             scored.sort(key=lambda x: x[0], reverse=True)
             _, best_data, best_fields, best_fl = scored[0]
-
             self._commit_decode(best_data, best_fields, best_fl)
-
-            # Log that we suppressed duplicates
             suppressed = [s[1].get("model", "?") for s in scored[1:]]
             if suppressed:
-                self._log_line(
-                    f"{C['dim']}[{_ts()}]{C['reset']} {C['dim']}DEDUP  "
-                    f"Suppressed {len(suppressed)} duplicate decode(s) of same burst: "
-                    f"{', '.join(suppressed)}{C['reset']}"
-                )
+                log_info(f"DEDUP: suppressed {len(suppressed)} duplicate decode(s): {', '.join(suppressed)}")
 
     def _commit_decode(self, data, fields, freq_label):
-        """Store a validated decode in the database and log it."""
         timestamp = data.get("time", datetime.now(timezone.utc).isoformat())
         model = data.get("model", "unknown")
         protocol = data.get("protocol", "")
@@ -672,16 +332,10 @@ class TPMSCapture:
                     pressure_kpa, temperature_c, battery_ok, flags, raw_json)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    timestamp,
-                    freq_mhz,
-                    str(protocol),
-                    model,
-                    fields["sensor_id"],
-                    fields["pressure_kpa"],
-                    fields["temperature_c"],
-                    fields["battery_ok"],
-                    fields["flags"],
-                    json.dumps(data),
+                    timestamp, freq_mhz, str(protocol), model,
+                    fields["sensor_id"], fields["pressure_kpa"],
+                    fields["temperature_c"], fields["battery_ok"],
+                    fields["flags"], json.dumps(data),
                 ),
             )
             self.conn.commit()
@@ -693,62 +347,35 @@ class TPMSCapture:
             self.sensor_models[fields["sensor_id"]] = model
             self.sensor_last_seen[fields["sensor_id"]] = timestamp
 
-        # Record in signal monitor
-        self.signal_monitor.record_signal(
-            freq_label, rssi, snr, noise, fields["sensor_id"], model
-        )
-
-        # ── Build detailed log line ──
+        # Build log line
         sid = fields["sensor_id"]
-        psi_str = ""
+        parts = [f"[{freq_label}] {C['bold']}{model}{C['reset']}  id={C['cyan']}{sid}{C['reset']}"]
         if fields["pressure_kpa"]:
-            psi_str = f"  pressure={fields['pressure_kpa']:.1f}kPa ({fields['pressure_kpa']/6.89476:.1f}psi)"
-        temp_str = ""
+            parts.append(f"pressure={fields['pressure_kpa']:.1f}kPa ({fields['pressure_kpa']/6.89476:.1f}psi)")
         if fields["temperature_c"] is not None:
-            temp_str = f"  temp={fields['temperature_c']:.1f}C"
-        batt_str = ""
+            parts.append(f"temp={fields['temperature_c']:.1f}C")
         if fields["battery_ok"] is not None:
-            batt_str = f"  batt={'OK' if fields['battery_ok'] else 'LOW'}"
-        flag_str = ""
+            parts.append(f"batt={'OK' if fields['battery_ok'] else 'LOW'}")
         if fields["flags"]:
-            flag_str = f"  flags={fields['flags']}"
-        signal_str = ""
+            parts.append(f"flags={fields['flags']}")
         if rssi is not None:
-            signal_str += f"  RSSI:{rssi:+.1f}dB {signal_bar(rssi, width=10)}"
+            parts.append(f"RSSI={rssi:+.1f}dB")
         if snr is not None:
-            signal_str += f"  SNR:{snr:.1f}dB"
+            parts.append(f"SNR={snr:.1f}dB")
         if noise is not None:
-            signal_str += f"  noise:{noise:+.1f}dB"
-        freq_str = f"  freq={freq_mhz:.3f}MHz" if freq_mhz else ""
+            parts.append(f"noise={noise:+.1f}dB")
+        if freq_mhz:
+            parts.append(f"freq={freq_mhz:.3f}MHz")
+        parts.append(f"proto={protocol}")
 
         new_tag = f"  {C['yellow']}** NEW SENSOR **{C['reset']}" if is_new_sensor else ""
-
-        self._log_line(
-            f"{C['dim']}[{_ts()}]{C['reset']} {C['green']}  RX{C['reset']}  "
-            f"[{freq_label}] {C['bold']}{model}{C['reset']}  "
-            f"id={C['cyan']}{sid}{C['reset']}"
-            f"{psi_str}{temp_str}{batt_str}{flag_str}{signal_str}{freq_str}"
-            f"  proto={protocol}{new_tag}"
-        )
+        log_rx("  ".join(parts) + new_tag)
 
         if is_new_sensor:
-            self._log_line(
-                f"{C['dim']}[{_ts()}]{C['reset']} {C['magenta']}  DB{C['reset']}  "
-                f"Stored new sensor {sid} ({model}) — "
-                f"{self.stats['unique_sensors']} unique sensors total"
-            )
-
-    def _log_line(self, text):
-        """Print a log line and track it for dashboard redraw logic."""
-        print(text, flush=True)
-        self.log_lines_since_dashboard += 1
+            log_db(f"Stored new sensor {sid} ({model}) — "
+                   f"{self.stats['unique_sensors']} unique sensors total")
 
     def process_line(self, line: str, freq_label: str):
-        """Process a single JSON line from rtl_433.
-
-        Buffers decodes that share the same timestamp+RSSI (same RF burst),
-        then picks the most plausible protocol to suppress false multi-decodes.
-        """
         line = line.strip()
         if not line:
             return
@@ -760,7 +387,6 @@ class TPMSCapture:
             return
 
         model = data.get("model", "unknown")
-
         if not is_tpms(data):
             log_info(f"[{freq_label}] Ignored non-TPMS decode: model={model}")
             return
@@ -768,18 +394,14 @@ class TPMSCapture:
         fields = extract_sensor_fields(data)
         rssi = data.get("rssi", None)
         timestamp = data.get("time", "")
-
-        # Group decodes from the same RF burst: same timestamp + same RSSI
         burst_key = (timestamp, rssi)
 
         if self._decode_buffer_key is not None and burst_key != self._decode_buffer_key:
-            # New burst — flush the previous one
             self._flush_decode_buffer()
 
         self._decode_buffer_key = burst_key
         self._decode_buffer.append((data, fields, freq_label))
 
-        # Schedule a flush in case no more lines arrive for this burst
         if self._decode_flush_timer is not None:
             self._decode_flush_timer.cancel()
         self._decode_flush_timer = threading.Timer(0.1, self._flush_decode_buffer)
@@ -787,18 +409,14 @@ class TPMSCapture:
         self._decode_flush_timer.start()
 
     def run_receiver(self, device_index: int, frequency: float, freq_label: str):
-        """Run rtl_433 for one dongle and process its output."""
         cmd = self.build_rtl433_cmd(device_index, frequency)
         log_sdr(f"[{freq_label}] Launching rtl_433 on device {device_index}")
         log_sdr(f"[{freq_label}] Command: {' '.join(cmd)}")
 
         try:
             proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1,
             )
         except FileNotFoundError:
             log_error(f"[{freq_label}] rtl_433 not found! Install it first.")
@@ -810,15 +428,11 @@ class TPMSCapture:
         self.processes.append(proc)
         log_ok(f"[{freq_label}] rtl_433 started (PID {proc.pid})")
 
-        # Stream stderr in a separate thread so we see SDR init messages
         stderr_t = threading.Thread(
-            target=self._stream_stderr,
-            args=(proc, freq_label),
-            daemon=True,
+            target=self._stream_stderr, args=(proc, freq_label), daemon=True,
         )
         stderr_t.start()
         self.stderr_threads.append(stderr_t)
-
         log_info(f"[{freq_label}] Listening for TPMS signals...")
 
         while self.running:
@@ -836,30 +450,28 @@ class TPMSCapture:
             log_warn(f"[{freq_label}] Receiver stopped unexpectedly")
 
     def print_periodic_status(self):
-        """Print the signal monitor dashboard every 10 seconds."""
         elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
-        pending = self.log_lines_since_dashboard
-        self.log_lines_since_dashboard = 0
-        display = self.signal_monitor.render_display(
-            self.stats["total_readings"],
-            self.stats["unique_sensors"],
-            elapsed,
-            pending_log_lines=pending,
+        mins = int(elapsed // 60)
+        secs = int(elapsed % 60)
+        alive = sum(1 for p in self.processes if p.poll() is None)
+        r315 = self.stats.get("readings_315MHz", 0)
+        r433 = self.stats.get("readings_433MHz", 0)
+        est_v = max(1, self.stats["unique_sensors"] // 4) if self.stats["unique_sensors"] > 0 else 0
+
+        log_stats(
+            f"uptime={mins:02d}:{secs:02d}  receivers={alive}/2  "
+            f"readings={self.stats['total_readings']} (315:{r315} 433:{r433})  "
+            f"unique_sensors={self.stats['unique_sensors']}  est_vehicles=~{est_v}"
         )
-        print(display, flush=True)
 
     def correlate_vehicles(self):
-        """Group sensor IDs that appear within short time windows into vehicles."""
         log_info("Correlating sensors into vehicle groups...")
         cur = self.conn.execute("""
             SELECT sensor_id, MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
                    COUNT(*) as reading_count, model
-            FROM readings
-            GROUP BY sensor_id
-            ORDER BY first_seen
+            FROM readings GROUP BY sensor_id ORDER BY first_seen
         """)
         sensors = cur.fetchall()
-
         if not sensors:
             log_warn("No sensors captured — nothing to correlate")
             return
@@ -867,7 +479,6 @@ class TPMSCapture:
         groups = []
         current_group = []
         current_time = None
-
         for sid, first_seen, last_seen, count, model in sensors:
             t = datetime.fromisoformat(first_seen)
             if current_time is None or (t - current_time).total_seconds() < 30:
@@ -879,7 +490,6 @@ class TPMSCapture:
                     groups.append(current_group)
                 current_group = [(sid, first_seen, last_seen, count, model)]
                 current_time = t
-
         if current_group:
             groups.append(current_group)
 
@@ -888,7 +498,6 @@ class TPMSCapture:
             vehicle_hash = "|".join(sensor_ids)
             first_seen = min(s[1] for s in group)
             last_seen = max(s[2] for s in group)
-
             self.conn.execute("""
                 INSERT INTO vehicles (vehicle_hash, sensor_ids, first_seen, last_seen, sighting_count)
                 VALUES (?, ?, ?, ?, 1)
@@ -896,7 +505,6 @@ class TPMSCapture:
                     last_seen = excluded.last_seen,
                     sighting_count = sighting_count + 1
             """, (vehicle_hash, json.dumps(sensor_ids), first_seen, last_seen))
-
         self.conn.commit()
         log_ok(f"Correlated into {len(groups)} potential vehicle group(s)")
 
@@ -908,7 +516,6 @@ class TPMSCapture:
                 log_info(f"    Sensor ID: {sid}")
 
     def print_summary(self):
-        """Print session summary."""
         elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
         mins = int(elapsed // 60)
         secs = int(elapsed % 60)
@@ -931,13 +538,10 @@ class TPMSCapture:
             print(f"\n  {C['bold']}Sensors by protocol:{C['reset']}")
             for model, count in sorted(model_counts.items(), key=lambda x: -x[1]):
                 print(f"    {model:<35} {count} sensor(s)")
-
         print(f"{C['bold']}{'='*70}{C['reset']}\n")
-
         self.correlate_vehicles()
 
     def shutdown(self, signum=None, frame=None):
-        """Clean shutdown."""
         if not self.running:
             return
         print()
@@ -963,42 +567,29 @@ class TPMSCapture:
         sys.exit(0)
 
     def _check_prerequisites(self):
-        """Verify rtl_433 and SDR dongles are available before starting."""
         log_info("Checking prerequisites...")
-
-        # Check rtl_433
         rtl_path = shutil.which("rtl_433")
         if not rtl_path:
             log_error("rtl_433 not found in PATH!")
-            log_error("Install it: https://github.com/merbanan/rtl_433")
             return False
         log_ok(f"rtl_433 found: {rtl_path}")
 
-        # Get version
         try:
-            ver = subprocess.run(
-                ["rtl_433", "-V"],
-                capture_output=True, text=True, timeout=5
-            )
+            ver = subprocess.run(["rtl_433", "-V"], capture_output=True, text=True, timeout=5)
             version_line = (ver.stdout + ver.stderr).strip().split("\n")[0]
             log_ok(f"rtl_433 version: {version_line}")
         except Exception:
             log_warn("Could not determine rtl_433 version")
 
-        # Check for dongles
         try:
-            result = subprocess.run(
-                ["rtl_test", "-t"],
-                capture_output=True, text=True, timeout=5
-            )
+            result = subprocess.run(["rtl_test", "-t"], capture_output=True, text=True, timeout=5)
             output = result.stdout + result.stderr
             if "Found 0 device" in output:
                 log_error("No RTL-SDR devices found!")
                 return False
-
             for line in output.split("\n"):
                 line = line.strip()
-                if line.startswith("Found") or ("Realtek" in line) or ("Using device" in line):
+                if line.startswith("Found") or "Realtek" in line or "Using device" in line:
                     log_sdr(line)
         except FileNotFoundError:
             log_warn("rtl_test not available — skipping device check")
@@ -1008,7 +599,6 @@ class TPMSCapture:
         return True
 
     def run(self):
-        """Main entry point — run both receivers."""
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGTERM, self.shutdown)
 
@@ -1022,25 +612,20 @@ class TPMSCapture:
 
         print()
         log_info(f"Database: {DB_PATH}")
-        log_info(f"All protocols enabled ({len(TPMS_PROTOCOLS)} known TPMS + auto-detect via type/model/fields)")
+        log_info(f"All protocols enabled ({len(TPMS_PROTOCOLS)} known TPMS + auto-detect)")
         log_info(f"Device 0 (E4000):  315.000 MHz (North America)")
         log_info(f"Device 1 (R820T):  433.920 MHz (Europe/aftermarket)")
-        log_info(f"Signal monitor updates every 10 seconds")
+        log_info(f"Web dashboard: uv run tpms-web")
         log_info(f"Press Ctrl+C to stop and see summary")
         print()
 
-        # Start both receivers in threads
         t315 = threading.Thread(
-            target=self.run_receiver,
-            args=(0, 315_000_000, "315MHz"),
-            daemon=True,
-            name="receiver-315MHz",
+            target=self.run_receiver, args=(0, 315_000_000, "315MHz"),
+            daemon=True, name="receiver-315MHz",
         )
         t433 = threading.Thread(
-            target=self.run_receiver,
-            args=(1, 433_920_000, "433MHz"),
-            daemon=True,
-            name="receiver-433MHz",
+            target=self.run_receiver, args=(1, 433_920_000, "433MHz"),
+            daemon=True, name="receiver-433MHz",
         )
 
         t315.start()
@@ -1049,16 +634,13 @@ class TPMSCapture:
         log_ok("433 MHz receiver thread started")
         print()
 
-        # Main loop: periodic signal monitor display
         try:
             while self.running:
                 time.sleep(1)
                 now = time.monotonic()
-                if now - self.last_status_time >= 10:
+                if now - self.last_status_time >= 30:
                     self.print_periodic_status()
                     self.last_status_time = now
-
-                    # Check if receivers are still alive
                     for proc in self.processes:
                         if proc.poll() is not None and self.running:
                             log_warn(f"rtl_433 PID {proc.pid} has exited (code {proc.returncode})")
