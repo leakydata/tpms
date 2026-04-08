@@ -489,6 +489,203 @@ def reprint():
     db.close()
 
 
+def bitbench():
+    """Export decoded flex decoder hex data formatted for triq.net/bitbench."""
+    db = get_db()
+
+    # Get hex data from flex decoder captures
+    rows = db.execute("""
+        SELECT model, raw_json, timestamp FROM signals
+        WHERE model LIKE 'Unknown-TPMS%'
+        ORDER BY model, timestamp
+    """).fetchall()
+
+    if not rows:
+        print("No flex decoder captures yet. Keep the capture tool running.")
+        return
+
+    import json as json_mod
+    by_model = defaultdict(list)
+    for r in rows:
+        try:
+            d = json_mod.loads(r["raw_json"])
+            codes = d.get("codes", [])
+            for c in codes:
+                if "{" in c:
+                    bits = c.split("}")[0].replace("{", "")
+                    hex_data = c.split("}")[1].upper()
+                    if int(bits) >= 24 and hex_data and not all(ch in "0" for ch in hex_data):
+                        spaced = " ".join(hex_data[i:i+2] for i in range(0, len(hex_data), 2))
+                        by_model[r["model"]].append({
+                            "hex": spaced, "bits": bits,
+                            "timestamp": r["timestamp"],
+                        })
+        except Exception:
+            pass
+
+    if not by_model:
+        print("No usable hex data captured yet. The flex decoders are running")
+        print("but haven't captured signals with enough data bits.")
+        return
+
+    for model, entries in sorted(by_model.items()):
+        print(f"\n{'='*60}")
+        print(f"  {model} — {len(entries)} capture(s)")
+        print(f"{'='*60}")
+        print()
+        print("  Paste into https://triq.net/bitbench :")
+        print()
+        for e in entries:
+            print(f"  {e['hex']}")
+        print()
+        print("  Try these format strings:")
+        print('  8h ID:16h 12d 4h 8h          # preamble + id + temp + flags + checksum')
+        print('  8h ^ID:16h ^12d 4h ^8h        # same but LSB-first (^ = reflect)')
+        print()
+
+        # Auto-analyze: find constant vs variable bytes
+        if len(entries) >= 2:
+            byte_lists = []
+            for e in entries:
+                byte_lists.append(e["hex"].split())
+
+            min_len = min(len(bl) for bl in byte_lists)
+            if min_len > 0:
+                print("  Auto-analysis:")
+                const_bytes = []
+                var_bytes = []
+                for i in range(min_len):
+                    vals = set(bl[i] for bl in byte_lists if i < len(bl))
+                    if len(vals) == 1:
+                        const_bytes.append((i, list(vals)[0]))
+                    else:
+                        var_bytes.append((i, vals))
+
+                if const_bytes:
+                    id_hex = " ".join(v for _, v in const_bytes)
+                    print(f"    Constant bytes (sensor ID?): positions {[p for p, _ in const_bytes]}")
+                    print(f"    Values: {id_hex}")
+                if var_bytes:
+                    print(f"    Variable bytes (data?): positions {[p for p, _ in var_bytes]}")
+                    for pos, vals in var_bytes:
+                        print(f"      Byte {pos}: {', '.join(sorted(vals))}")
+                print()
+
+    # Also generate bitbench URL
+    for model, entries in sorted(by_model.items()):
+        if entries:
+            import urllib.parse
+            params = []
+            for e in entries:
+                params.append(("c", e["hex"]))
+            params.append(("f", "8h ID:16h 12d 4h 8h"))
+            url = "https://triq.net/bitbench#" + "&".join(
+                f"{k}={urllib.parse.quote(v)}" for k, v in params
+            )
+            print(f"  BitBench link for {model}:")
+            print(f"  {url}")
+            print()
+
+    db.close()
+
+
+def auto_analyze():
+    """Automatically analyze all available data — decoded + unknown."""
+    db = get_db()
+    import json as json_mod
+
+    print("=" * 70)
+    print("  Automated Analysis Report")
+    print("=" * 70)
+
+    # 1. Known TPMS sensors summary
+    sensors = db.execute("""
+        SELECT model, COUNT(*) as cnt,
+               COUNT(CASE WHEN reading_count > 1 THEN 1 END) as repeat_sensors
+        FROM sensors GROUP BY model ORDER BY cnt DESC
+    """).fetchall()
+
+    print(f"\n  Known TPMS sensors: {sum(s['cnt'] for s in sensors)}")
+    for s in sensors:
+        print(f"    {s['model']:<20} {s['cnt']:>3} sensors ({s['repeat_sensors']} seen >1x)")
+
+    # 2. Flex decoder results
+    flex = db.execute("""
+        SELECT model, COUNT(*) as cnt
+        FROM signals WHERE model LIKE 'Unknown-TPMS%'
+        GROUP BY model ORDER BY cnt DESC
+    """).fetchall()
+
+    if flex:
+        print(f"\n  Flex decoder captures:")
+        for f in flex:
+            print(f"    {f['model']:<20} {f['cnt']:>3} signals")
+
+        # Extract and auto-analyze hex
+        for f in flex:
+            model = f["model"]
+            rows = db.execute(
+                "SELECT raw_json FROM signals WHERE model = ? ORDER BY timestamp",
+                (model,)
+            ).fetchall()
+
+            hex_lines = []
+            for r in rows:
+                try:
+                    d = json_mod.loads(r["raw_json"])
+                    for c in d.get("codes", []):
+                        if "{" in c:
+                            bits = int(c.split("}")[0].replace("{", ""))
+                            hex_data = c.split("}")[1].upper()
+                            if bits >= 24 and not all(ch in "0" for ch in hex_data):
+                                hex_lines.append(hex_data)
+                except Exception:
+                    pass
+
+            if len(hex_lines) >= 2:
+                print(f"\n    {model}: {len(hex_lines)} hex captures — analyzing...")
+
+                # Find constant/variable bytes
+                byte_lists = [
+                    [h[i:i+2] for i in range(0, len(h), 2)]
+                    for h in hex_lines
+                ]
+                min_len = min(len(bl) for bl in byte_lists)
+
+                const_pos = []
+                var_pos = []
+                for i in range(min_len):
+                    vals = set(bl[i] for bl in byte_lists if i < len(bl))
+                    if len(vals) == 1:
+                        const_pos.append(i)
+                    else:
+                        var_pos.append(i)
+
+                if const_pos:
+                    id_bytes = " ".join(byte_lists[0][i] for i in const_pos)
+                    print(f"      Candidate sensor ID (constant bytes): {id_bytes}")
+                if var_pos:
+                    print(f"      Data payload (variable bytes): positions {var_pos}")
+
+                    # Try to detect temperature encoding
+                    if len(var_pos) >= 2:
+                        print(f"      Possible field layout:")
+                        print(f"        Bytes 0-{const_pos[-1] if const_pos else 0}: preamble/ID")
+                        print(f"        Bytes {var_pos[0]}-{var_pos[-1]}: data (pressure/temp/flags)")
+                        print(f"        Byte {min_len-1}: likely checksum")
+
+    # 3. Unknown signal clusters
+    unknowns = db.execute("""
+        SELECT COUNT(*) FROM unknown_signals WHERE pulse_count >= 30
+    """).fetchone()[0]
+
+    print(f"\n  Unknown TPMS-range signals: {unknowns}")
+    print(f"  Run 'uv run tpms-decode candidates' for cluster analysis")
+
+    print()
+    db.close()
+
+
 def main():
     if len(sys.argv) < 2:
         report()
@@ -500,12 +697,18 @@ def main():
         candidates()
     elif sys.argv[1] == "reprint":
         reprint()
+    elif sys.argv[1] == "bitbench":
+        bitbench()
+    elif sys.argv[1] == "auto":
+        auto_analyze()
     else:
         print("Usage:")
         print("  uv run tpms-decode                  Full report with fuzzy clustering")
         print("  uv run tpms-decode clusters          Show all protocol clusters in detail")
         print("  uv run tpms-decode compare <group>   Compare captures (e.g. G01)")
         print("  uv run tpms-decode candidates        Ranked TPMS candidates")
+        print("  uv run tpms-decode bitbench           Export hex data for triq.net/bitbench")
+        print("  uv run tpms-decode auto               Automated full analysis")
         print("  uv run tpms-decode reprint           Recompute fingerprints with bucketing")
 
 
