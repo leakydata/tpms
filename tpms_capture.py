@@ -51,9 +51,18 @@ FREQ_PRESETS = {
 
 # Serial-to-frequency mapping. If a dongle has a known serial, assign
 # it to a specific frequency. Overrides tuner-based auto-assignment.
+#
+# With 4 dongles we cover the major ISM/TPMS bands:
+#   315 MHz  — US TPMS standard (mandated since 2007)
+#   433.92 MHz — EU TPMS + aftermarket + many ISM devices
+#   345 MHz  — GM/Chrysler TPMS (some models use this instead of 315)
+#   868 MHz  — EU ISM band (some EU TPMS, key fobs, IoT sensors)
+#
 SERIAL_FREQ_MAP = {
-    "TPMS_R820T": ("433MHz", 433_920_000),   # better tuner → primary band
-    "TPMS_E4000": ("315MHz", 315_000_000),   # older tuner → secondary band
+    "TPMS_R820T":   ("433MHz", 433_920_000),   # R820T → EU TPMS + aftermarket
+    "TPMS_R820T_2": ("315MHz", 315_000_000),   # R820T → US TPMS standard
+    "TPMS_R820T_3": ("345MHz", 345_000_000),   # R820T → GM/Chrysler TPMS band
+    "TPMS_E4000":   ("868MHz", 868_000_000),   # E4000 → EU ISM (TPMS + IoT)
 }
 
 # ── Logging helpers ──────────────────────────────────────────────────────────
