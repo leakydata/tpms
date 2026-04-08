@@ -445,21 +445,18 @@ class TPMSCapture:
         now = datetime.now(timezone.utc).isoformat()
         analysis_text = "\n".join(lines)
 
-        # Quick pre-filter: extract pulse count early and skip obvious noise
+        # Quick pre-filter: skip signals that aren't TPMS candidates.
+        # Real TPMS signals have 30-120 pulses in 5-25ms.
+        # Anything under 30 pulses is local device noise (garage doors,
+        # security sensors, weather stations, etc.)
         for line in lines:
             m = re.search(r"Total count:\s*(\d+),\s*width:\s*([\d.]+)\s*ms", line)
             if m:
                 pc = int(m.group(1))
                 wms = float(m.group(2))
-                if pc <= 3 and wms < 1.0:
-                    # Single/double pulse under 1ms = electrical noise
+                if pc < 30:
+                    self.stats["unknown_filtered"] += 1
                     return
-                # Rate-limit storage of short bursts (likely local devices)
-                # Only store every 10th occurrence to avoid flooding the DB
-                if pc <= 10:
-                    self.stats["unknown_short_bursts"] += 1
-                    if self.stats["unknown_short_bursts"] % 10 != 1:
-                        return
                 break
 
         # Extract fields
@@ -909,7 +906,7 @@ class TPMSCapture:
             f"signals={self.stats.get('total_signals', 0)}  "
             f"tpms_readings={self.stats['total_readings']} (315:{r315} 433:{r433})  "
             f"non_tpms={self.stats.get('non_tpms_signals', 0)}  "
-            f"unknown={self.stats.get('unknown_signals', 0)}  "
+            f"unknown={self.stats.get('unknown_signals', 0)} (filtered:{self.stats.get('unknown_filtered', 0)})  "
             f"sensors={self.stats['unique_sensors']}  "
             f"est_vehicles=~{est_v}"
         )
