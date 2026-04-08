@@ -75,7 +75,7 @@ function loadSensors() {
                 }
 
                 html += `<tr>
-                    <td class="mono" style="color:var(--cyan)">${s.sensor_id}</td>
+                    <td class="mono" style="color:var(--cyan);cursor:pointer;text-decoration:underline" onclick="showSensorDetail('${s.sensor_id}')">${s.sensor_id}</td>
                     <td class="mono">${s.model || '-'}</td>
                     <td>${s.reading_count}</td>
                     <td class="mono dim">${s.first_seen || '-'}</td>
@@ -113,6 +113,25 @@ function loadVehicles() {
             });
             html += '</tbody></table>';
             document.getElementById('vehicles-content').innerHTML = html;
+        });
+}
+
+function showSensorDetail(sensorId) {
+    fetch('/api/sensor/' + sensorId)
+        .then(r => r.json())
+        .then(data => {
+            let html = '<div class="card" style="margin-top:16px"><h2>Sensor ' + sensorId + ' History</h2>';
+            html += '<table><thead><tr><th>Timestamp</th><th>Pressure (kPa)</th><th>Temp (C)</th><th>Battery</th><th>Flags</th></tr></thead><tbody>';
+            for (let r of data.readings) {
+                html += '<tr><td class="mono dim">' + r.timestamp + '</td>';
+                html += '<td>' + (r.pressure_kpa ? r.pressure_kpa.toFixed(1) : '-') + '</td>';
+                html += '<td>' + (r.temperature_c != null ? r.temperature_c.toFixed(1) : '-') + '</td>';
+                html += '<td>' + (r.battery_ok === 1 ? 'OK' : r.battery_ok === 0 ? 'LOW' : '-') + '</td>';
+                html += '<td class="mono dim">' + (r.flags || '-') + '</td></tr>';
+            }
+            html += '</tbody></table></div>';
+            document.getElementById('sensor-detail').innerHTML = html;
+            document.getElementById('sensor-detail').scrollIntoView({behavior: 'smooth'});
         });
 }
 
