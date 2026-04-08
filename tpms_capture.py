@@ -361,7 +361,7 @@ class TPMSCapture:
             "-A",                                    # pulse analysis on unknown signals
             "-S", "unknown",                         # save raw IQ of unknown signals to cwd
             "-Y", "autolevel",                       # auto signal level detection
-            "-Y", "minlevel=-30",                    # capture weaker signals too
+            "-Y", "minlevel=-15",                    # filter out weak noise, keep real signals
             "-F", "json",
         ] + protocol_args
 
@@ -445,6 +445,23 @@ class TPMSCapture:
         """
         now = datetime.now(timezone.utc).isoformat()
         analysis_text = "\n".join(lines)
+
+        # Quick pre-filter: extract pulse count early and skip obvious noise
+        for line in lines:
+            m = re.search(r"Total count:\s*(\d+),\s*width:\s*([\d.]+)\s*ms", line)
+            if m:
+                pc = int(m.group(1))
+                wms = float(m.group(2))
+                if pc <= 3 and wms < 1.0:
+                    # Single/double pulse under 1ms = electrical noise
+                    return
+                # Rate-limit storage of short bursts (likely local devices)
+                # Only store every 10th occurrence to avoid flooding the DB
+                if pc <= 10:
+                    self.stats["unknown_short_bursts"] += 1
+                    if self.stats["unknown_short_bursts"] % 10 != 1:
+                        return
+                break
 
         # Extract fields
         pulse_count = None
