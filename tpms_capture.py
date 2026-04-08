@@ -298,14 +298,18 @@ class SignalMonitor:
         result += C["reset"]
         return result
 
-    def render_display(self, total_readings, unique_sensors, uptime_secs):
-        """Render the full signal monitor display."""
+    def render_display(self, total_readings, unique_sensors, uptime_secs, pending_log_lines=0):
+        """Render the full signal monitor display.
+
+        If this is not the first render, prepend ANSI cursor-up codes to
+        overwrite the previous dashboard in-place.  If log lines were printed
+        between renders, we skip the overwrite and just print fresh.
+        """
         mins = int(uptime_secs // 60)
         secs = int(uptime_secs % 60)
         now = time.monotonic()
 
         lines = []
-        lines.append("")
         lines.append(f"  {C['bold']}{C['cyan']}┌─ Signal Monitor ─────────────────────────────────────────────────────────────┐{C['reset']}")
 
         for label in ("315MHz", "433MHz"):
@@ -379,9 +383,20 @@ class SignalMonitor:
             f"{C['bold']}est vehicles:{C['reset']} ~{est_v}"
         )
         lines.append(f"  {C['bold']}{C['cyan']}└──────────────────────────────────────────────────────────────────────────────┘{C['reset']}")
-        lines.append("")
 
-        return "\n".join(lines)
+        n_lines = len(lines)
+
+        # If log lines were printed since last render, we can't overwrite —
+        # just print fresh.  Otherwise, move cursor up to overwrite in-place.
+        prefix = ""
+        if not self._first_render and pending_log_lines == 0 and self.DASHBOARD_LINES > 0:
+            # Move cursor up N lines + clear each line as we redraw
+            prefix = f"\033[{self.DASHBOARD_LINES}A"
+
+        self.DASHBOARD_LINES = n_lines
+        self._first_render = False
+
+        return prefix + "\n".join(f"\033[2K{l}" for l in lines)
 
 
 # ── Database ─────────────────────────────────────────────────────────────────
@@ -513,6 +528,11 @@ class TPMSCapture:
         self.last_status_time = time.monotonic()
         self.stderr_threads = []
         self.signal_monitor = SignalMonitor()
+        self.log_lines_since_dashboard = 0  # tracks lines printed between dashboard redraws
+        # Duplicate detection: buffer decodes that share timestamp+RSSI
+        self._decode_buffer = []       # list of (data_dict, fields, freq_label)
+        self._decode_buffer_key = None # (timestamp, rssi) of current burst
+        self._decode_flush_timer = None
 
     def build_rtl433_cmd(self, device_index: int, frequency: float) -> list:
         """Build rtl_433 command for a specific device and frequency."""
@@ -552,26 +572,58 @@ class TPMSCapture:
             else:
                 log_sdr(f"[{freq_label}] {line}")
 
-    def process_line(self, line: str, freq_label: str):
-        """Process a single JSON line from rtl_433."""
-        line = line.strip()
-        if not line:
+    def _score_decode(self, fields):
+        """Score a decode's plausibility. Higher = more likely to be real."""
+        score = 0
+        temp = fields["temperature_c"]
+        if temp is not None:
+            # Sane tire temperature: -10C to 80C
+            if -10 <= temp <= 80:
+                score += 10
+            else:
+                score -= 20  # absurd temp = likely false decode
+        pres = fields["pressure_kpa"]
+        if pres is not None:
+            # Sane tire pressure: 100-400 kPa (14-58 psi)
+            if 100 <= pres <= 400:
+                score += 5
+            else:
+                score -= 10
+        return score
+
+    def _flush_decode_buffer(self):
+        """Flush buffered decodes, keeping only the best per-burst."""
+        if not self._decode_buffer:
             return
 
-        try:
-            data = json.loads(line)
-        except json.JSONDecodeError:
-            log_warn(f"[{freq_label}] Non-JSON output: {line[:120]}")
-            return
+        buf = self._decode_buffer
+        self._decode_buffer = []
+        self._decode_buffer_key = None
 
-        model = data.get("model", "unknown")
+        if len(buf) == 1:
+            # Single decode, no dedup needed
+            self._commit_decode(*buf[0])
+        else:
+            # Multiple protocols decoded the same burst — pick the best
+            scored = [(self._score_decode(fields), data, fields, fl) for data, fields, fl in buf]
+            scored.sort(key=lambda x: x[0], reverse=True)
+            _, best_data, best_fields, best_fl = scored[0]
 
-        if not is_tpms(data):
-            log_info(f"[{freq_label}] Ignored non-TPMS decode: model={model}")
-            return
+            self._commit_decode(best_data, best_fields, best_fl)
 
-        fields = extract_sensor_fields(data)
+            # Log that we suppressed duplicates
+            suppressed = [s[1].get("model", "?") for s in scored[1:]]
+            if suppressed:
+                self._log_line(
+                    f"{C['dim']}[{_ts()}]{C['reset']} {C['dim']}DEDUP  "
+                    f"Suppressed {len(suppressed)} duplicate decode(s) of same burst: "
+                    f"{', '.join(suppressed)}{C['reset']}"
+                )
+
+    def _commit_decode(self, data, fields, freq_label):
+        """Store a validated decode in the database and log it."""
         timestamp = data.get("time", datetime.now(timezone.utc).isoformat())
+        model = data.get("model", "unknown")
         protocol = data.get("protocol", "")
         freq_mhz = data.get("freq", None)
         snr = data.get("snr", None)
@@ -638,7 +690,8 @@ class TPMSCapture:
 
         new_tag = f"  {C['yellow']}** NEW SENSOR **{C['reset']}" if is_new_sensor else ""
 
-        log_rx(
+        self._log_line(
+            f"{C['dim']}[{_ts()}]{C['reset']} {C['green']}  RX{C['reset']}  "
             f"[{freq_label}] {C['bold']}{model}{C['reset']}  "
             f"id={C['cyan']}{sid}{C['reset']}"
             f"{psi_str}{temp_str}{batt_str}{flag_str}{signal_str}{freq_str}"
@@ -646,8 +699,59 @@ class TPMSCapture:
         )
 
         if is_new_sensor:
-            log_db(f"Stored new sensor {sid} ({model}) — "
-                   f"{self.stats['unique_sensors']} unique sensors total")
+            self._log_line(
+                f"{C['dim']}[{_ts()}]{C['reset']} {C['magenta']}  DB{C['reset']}  "
+                f"Stored new sensor {sid} ({model}) — "
+                f"{self.stats['unique_sensors']} unique sensors total"
+            )
+
+    def _log_line(self, text):
+        """Print a log line and track it for dashboard redraw logic."""
+        print(text, flush=True)
+        self.log_lines_since_dashboard += 1
+
+    def process_line(self, line: str, freq_label: str):
+        """Process a single JSON line from rtl_433.
+
+        Buffers decodes that share the same timestamp+RSSI (same RF burst),
+        then picks the most plausible protocol to suppress false multi-decodes.
+        """
+        line = line.strip()
+        if not line:
+            return
+
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            log_warn(f"[{freq_label}] Non-JSON output: {line[:120]}")
+            return
+
+        model = data.get("model", "unknown")
+
+        if not is_tpms(data):
+            log_info(f"[{freq_label}] Ignored non-TPMS decode: model={model}")
+            return
+
+        fields = extract_sensor_fields(data)
+        rssi = data.get("rssi", None)
+        timestamp = data.get("time", "")
+
+        # Group decodes from the same RF burst: same timestamp + same RSSI
+        burst_key = (timestamp, rssi)
+
+        if self._decode_buffer_key is not None and burst_key != self._decode_buffer_key:
+            # New burst — flush the previous one
+            self._flush_decode_buffer()
+
+        self._decode_buffer_key = burst_key
+        self._decode_buffer.append((data, fields, freq_label))
+
+        # Schedule a flush in case no more lines arrive for this burst
+        if self._decode_flush_timer is not None:
+            self._decode_flush_timer.cancel()
+        self._decode_flush_timer = threading.Timer(0.1, self._flush_decode_buffer)
+        self._decode_flush_timer.daemon = True
+        self._decode_flush_timer.start()
 
     def run_receiver(self, device_index: int, frequency: float, freq_label: str):
         """Run rtl_433 for one dongle and process its output."""
@@ -701,10 +805,13 @@ class TPMSCapture:
     def print_periodic_status(self):
         """Print the signal monitor dashboard every 10 seconds."""
         elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
+        pending = self.log_lines_since_dashboard
+        self.log_lines_since_dashboard = 0
         display = self.signal_monitor.render_display(
             self.stats["total_readings"],
             self.stats["unique_sensors"],
             elapsed,
+            pending_log_lines=pending,
         )
         print(display, flush=True)
 
@@ -803,6 +910,7 @@ class TPMSCapture:
         print()
         log_info("Shutdown signal received")
         self.running = False
+        self._flush_decode_buffer()
 
         for proc in self.processes:
             if proc.poll() is None:
