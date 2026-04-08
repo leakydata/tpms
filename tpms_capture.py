@@ -1022,7 +1022,7 @@ class TPMSCapture:
 
         print()
         log_info(f"Database: {DB_PATH}")
-        log_info(f"Monitoring {len(TPMS_PROTOCOLS)} TPMS protocols")
+        log_info(f"All protocols enabled ({len(TPMS_PROTOCOLS)} known TPMS + auto-detect via type/model/fields)")
         log_info(f"Device 0 (E4000):  315.000 MHz (North America)")
         log_info(f"Device 1 (R820T):  433.920 MHz (Europe/aftermarket)")
         log_info(f"Signal monitor updates every 10 seconds")
