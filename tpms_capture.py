@@ -365,27 +365,44 @@ class TPMSCapture:
 
         return cmd
 
+    # Lines that are part of an -A pulse analysis block
+    _ANALYSIS_PATTERNS = (
+        "analyzing pulses", "total count:", "pulse width distribution",
+        "gap width distribution", "pulse+gap period", "guessing modulation",
+        "pulse_demod_", "bitbuffer", "codes :", "view at https://triq.org",
+        "[00]", "[01]", "[02]", "[03]", "[04]",  # bitbuffer row indices
+        "  [", "count:", "width:", "mean:", "min:", "max:",
+    )
+
+    def _is_analysis_line(self, lower_line):
+        """Check if a stderr line is part of a pulse analysis block."""
+        return any(p in lower_line for p in self._ANALYSIS_PATTERNS)
+
     def _stream_stderr(self, proc, freq_label: str, device_index: int):
         for line in proc.stderr:
             line = line.strip()
             if not line:
+                # Blank line inside analysis block = still part of block
+                if device_index in self._analysis_buffer:
+                    self._analysis_buffer[device_index].append("")
                 continue
             lower = line.lower()
 
             # Detect pulse analysis blocks from -A flag (unknown signals)
-            if line.startswith("Analyzing") or "pulse_demod" in lower:
-                if device_index not in self._analysis_buffer:
-                    self._analysis_buffer[device_index] = []
-                self._analysis_buffer[device_index].append(line)
-                log_info(f"[{freq_label}] {C['yellow']}UNKNOWN{C['reset']}  {line}")
+            if line.startswith("Analyzing pulses") and device_index not in self._analysis_buffer:
+                # Start of new analysis block
+                self._analysis_buffer[device_index] = [line]
+                log_info(f"[{freq_label}] {C['yellow']}UNKNOWN{C['reset']}  Signal detected — analyzing...")
                 continue
             elif device_index in self._analysis_buffer:
-                # End of analysis block — store it
-                buf = self._analysis_buffer.pop(device_index)
-                buf.append(line)
-                self._store_unknown(device_index, freq_label, "\n".join(buf))
-                log_info(f"[{freq_label}] {C['yellow']}UNKNOWN{C['reset']}  Stored unknown signal analysis ({len(buf)} lines)")
-                continue
+                if self._is_analysis_line(lower):
+                    self._analysis_buffer[device_index].append(line)
+                    continue
+                else:
+                    # Non-analysis line = end of block
+                    buf = self._analysis_buffer.pop(device_index)
+                    self._store_unknown(device_index, freq_label, buf)
+                    # Fall through to classify this line normally
 
             # Capture tuner info for receiver status
             if "found" in lower and "tuner" in lower:
@@ -404,17 +421,85 @@ class TPMSCapture:
             else:
                 log_sdr(f"[{freq_label}] {line}")
 
-    def _store_unknown(self, device_index, freq_label, analysis_text):
-        """Store an unknown signal detection."""
+    def _store_unknown(self, device_index, freq_label, lines):
+        """Parse and store an unknown signal analysis block.
+
+        Extracts structural features for fingerprinting:
+        - Pulse count and width (protocol-level, stable across transmissions)
+        - Modulation type (OOK, FSK, etc.)
+        - Raw hex data (contains the actual bits — ID portion is stable)
+
+        The fingerprint is a hash of the structural features (modulation +
+        pulse count + timing), NOT the data payload. This means all sensors
+        using the same protocol produce the same fingerprint. To identify
+        individual sensors within an unknown protocol, compare the raw_hex
+        across multiple receptions — the bits that stay constant are the ID.
+        """
         now = datetime.now(timezone.utc).isoformat()
+        analysis_text = "\n".join(lines)
+
+        # Extract fields
+        pulse_count = None
+        width_ms = None
+        modulation = None
+        raw_hex_parts = []
+
+        for line in lines:
+            # "Total count:   60,  width: 7.98 ms"
+            m = re.search(r"Total count:\s*(\d+),\s*width:\s*([\d.]+)\s*ms", line)
+            if m:
+                pulse_count = int(m.group(1))
+                width_ms = float(m.group(2))
+
+            # "Guessing modulation: FSK_PCM" or "pulse_demod_pcm"
+            if "guessing modulation:" in line.lower():
+                modulation = line.split(":")[-1].strip()
+            elif "pulse_demod_" in line.lower():
+                m2 = re.search(r"pulse_demod_(\w+)", line.lower())
+                if m2 and not modulation:
+                    modulation = m2.group(1).upper()
+
+            # Raw hex from triq.org links or bitbuffer codes
+            if "triq.org/pdv/#" in line:
+                hex_part = line.split("#")[-1].strip()
+                if hex_part:
+                    raw_hex_parts.append(hex_part)
+            # Bitbuffer rows like "[00] {68} ab cd ef ..."
+            m3 = re.match(r"\s*\[\d+\]\s*\{(\d+)\}\s+([\da-fA-F\s]+)", line)
+            if m3:
+                raw_hex_parts.append(m3.group(2).strip())
+
+        raw_hex = " | ".join(raw_hex_parts) if raw_hex_parts else None
+
+        # Structural fingerprint: hash of protocol-level features
+        # This is stable across different sensors using the same protocol
+        fp_input = f"{modulation or '?'}:{pulse_count or '?'}:{width_ms or '?'}"
+        fingerprint = hashlib.sha256(fp_input.encode()).hexdigest()[:16]
+
         with self.lock:
             self.conn.execute(
-                """INSERT INTO unknown_signals (timestamp, device_index, frequency_label, analysis_text)
-                   VALUES (?, ?, ?, ?)""",
-                (now, device_index, freq_label, analysis_text),
+                """INSERT INTO unknown_signals
+                   (timestamp, device_index, frequency_label, pulse_count,
+                    width_ms, modulation, raw_hex, fingerprint, analysis_text)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (now, device_index, freq_label, pulse_count,
+                 width_ms, modulation, raw_hex, fingerprint, analysis_text),
             )
             self.conn.commit()
             self.stats["unknown_signals"] += 1
+
+        # Log summary
+        mod_str = modulation or "unknown"
+        pc_str = f"{pulse_count}p" if pulse_count else "?"
+        w_str = f"{width_ms:.1f}ms" if width_ms else "?"
+        hex_preview = (raw_hex[:40] + "...") if raw_hex and len(raw_hex) > 40 else (raw_hex or "no data")
+        log_info(
+            f"[{freq_label}] {C['yellow']}UNKNOWN{C['reset']}  "
+            f"fp={C['cyan']}{fingerprint}{C['reset']}  "
+            f"{mod_str} {pc_str} {w_str}  "
+            f"hex={hex_preview}  "
+            f"({len(lines)} analysis lines)"
+        )
 
     def _register_receiver(self, device_index, freq_label, frequency, pid):
         """Register a receiver in the database."""
