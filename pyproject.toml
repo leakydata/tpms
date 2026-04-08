@@ -1,0 +1,15 @@
+[project]
+name = "tpms-capture"
+version = "0.1.0"
+description = "TPMS sensor capture and analysis tool for anti-stalking research"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+tpms-capture = "tpms_capture:main"
+tpms-analyze = "tpms_analyze:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
