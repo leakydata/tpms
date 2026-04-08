@@ -309,7 +309,13 @@ def is_tpms(data: dict) -> bool:
 
 
 def detect_dongles():
-    """Auto-detect connected RTL-SDR dongles."""
+    """Auto-detect connected RTL-SDR dongles and identify their tuners.
+
+    Returns a list of dicts: [{"index": 0, "tuner": "R820T", "name": "..."}, ...]
+    Uses rtl_433 -T 0 to probe each device briefly and read the tuner type.
+    """
+    # First find how many devices
+    n_devices = 0
     try:
         result = subprocess.run(
             ["rtl_test", "-t"], capture_output=True, text=True, timeout=5
@@ -317,13 +323,37 @@ def detect_dongles():
         output = result.stdout + result.stderr
         for line in output.split("\n"):
             if line.strip().startswith("Found"):
-                import re
                 m = re.search(r"Found (\d+) device", line)
                 if m:
-                    return int(m.group(1))
+                    n_devices = int(m.group(1))
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    return 0
+
+    if n_devices == 0:
+        return []
+
+    # Probe each device to find its tuner type
+    dongles = []
+    for i in range(n_devices):
+        tuner = "unknown"
+        try:
+            # Run rtl_433 briefly just to read the tuner info from stderr
+            result = subprocess.run(
+                ["rtl_433", "-d", str(i), "-T", "0"],
+                capture_output=True, text=True, timeout=5
+            )
+            stderr = result.stdout + result.stderr
+            for line in stderr.split("\n"):
+                if "Found" in line and "tuner" in line.lower():
+                    tuner = line.split("Found ")[-1].strip()
+                    break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        dongles.append({"index": i, "tuner": tuner})
+        log_sdr(f"Device {i}: {tuner}")
+
+    return dongles
 
 
 # ── Main capture class ───────────────────────────────────────────────────────
@@ -1062,28 +1092,51 @@ class TPMSCapture:
             log_error("Prerequisites not met — exiting")
             sys.exit(1)
 
-        # Auto-detect dongles
-        n_dongles = detect_dongles()
-        if n_dongles == 0:
-            log_warn("No RTL-SDR devices detected — will try to start anyway")
-            n_dongles = 2  # try the default 2
+        # Auto-detect dongles and identify tuners
+        dongles = detect_dongles()
+        if not dongles:
+            log_warn("No RTL-SDR devices detected — will try 2 devices anyway")
+            dongles = [{"index": 0, "tuner": "unknown"}, {"index": 1, "tuner": "unknown"}]
 
-        log_ok(f"Detected {n_dongles} RTL-SDR dongle(s)")
+        log_ok(f"Detected {len(dongles)} RTL-SDR dongle(s)")
 
-        # Assign frequencies: cycle through bands
-        freq_list = list(FREQ_PRESETS.items())
+        # Smart frequency assignment based on tuner capability.
+        # R820T/R820T2 is the better tuner — assign it to 433 MHz where
+        # most TPMS data comes from. E4000 gets 315 MHz.
+        # If tuners are the same type, just cycle through bands.
+        freq_list = list(FREQ_PRESETS.items())  # [("315MHz", 315M), ("433MHz", 433.92M)]
         assignments = []
-        for i in range(n_dongles):
-            label, freq = freq_list[i % len(freq_list)]
-            if n_dongles > len(freq_list) and i >= len(freq_list):
-                label = f"{label}-{i}"
-            assignments.append((i, freq, label))
+
+        if len(dongles) >= 2:
+            # Check if we have mixed tuners
+            tuner_strs = [d["tuner"].lower() for d in dongles]
+            r820t_indices = [d["index"] for d in dongles if "r820" in d["tuner"].lower()]
+            e4000_indices = [d["index"] for d in dongles if "e4000" in d["tuner"].lower()]
+
+            if r820t_indices and e4000_indices:
+                # Mixed tuners: put R820T on 433 MHz (better tuner, more data)
+                # and E4000 on 315 MHz
+                assignments.append((r820t_indices[0], 433_920_000, "433MHz"))
+                assignments.append((e4000_indices[0], 315_000_000, "315MHz"))
+                log_info(f"Smart assignment: R820T → 433 MHz, E4000 → 315 MHz")
+            else:
+                # Same tuner types or unknown — just cycle
+                for i, dongle in enumerate(dongles):
+                    label, freq = freq_list[i % len(freq_list)]
+                    if len(dongles) > len(freq_list) and i >= len(freq_list):
+                        label = f"{label}-{i}"
+                    assignments.append((dongle["index"], freq, label))
+        else:
+            # Single dongle — assign to 433 MHz (more TPMS data there)
+            assignments.append((dongles[0]["index"], 433_920_000, "433MHz"))
+            log_info("Single dongle — assigned to 433 MHz (primary TPMS band)")
 
         print()
         log_info(f"Database: {DB_PATH}")
-        log_info(f"All {317} protocols enabled (all signals stored, TPMS enriched)")
+        log_info(f"All protocols enabled (all signals stored, TPMS enriched)")
         for dev_idx, freq, label in assignments:
-            log_info(f"Device {dev_idx}: {freq/1e6:.3f} MHz ({label})")
+            tuner = next((d["tuner"] for d in dongles if d["index"] == dev_idx), "?")
+            log_info(f"Device {dev_idx} ({tuner}): {freq/1e6:.3f} MHz ({label})")
         log_info(f"Web dashboard: uv run tpms-web")
         log_info(f"Press Ctrl+C to stop and see summary")
         print()
