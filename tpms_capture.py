@@ -49,6 +49,13 @@ FREQ_PRESETS = {
     "433MHz": 433_920_000,   # Europe / aftermarket
 }
 
+# Serial-to-frequency mapping. If a dongle has a known serial, assign
+# it to a specific frequency. Overrides tuner-based auto-assignment.
+SERIAL_FREQ_MAP = {
+    "TPMS_R820T": ("433MHz", 433_920_000),   # better tuner → primary band
+    "TPMS_E4000": ("315MHz", 315_000_000),   # older tuner → secondary band
+}
+
 # ── Logging helpers ──────────────────────────────────────────────────────────
 
 COLORS = {
@@ -332,26 +339,41 @@ def detect_dongles():
     if n_devices == 0:
         return []
 
-    # Probe each device to find its tuner type
+    # Probe each device to find its tuner type and serial
     dongles = []
     for i in range(n_devices):
         tuner = "unknown"
+        serial = ""
         try:
-            # Run rtl_433 briefly just to read the tuner info from stderr
+            # Read EEPROM for serial
             result = subprocess.run(
-                ["rtl_433", "-d", str(i), "-T", "0"],
+                ["rtl_eeprom", "-d", str(i)],
                 capture_output=True, text=True, timeout=5
             )
-            stderr = result.stdout + result.stderr
-            for line in stderr.split("\n"):
+            for line in (result.stdout + result.stderr).split("\n"):
+                if "Serial number:" in line and "enabled" not in line:
+                    serial = line.split(":")[-1].strip()
                 if "Found" in line and "tuner" in line.lower():
                     tuner = line.split("Found ")[-1].strip()
-                    break
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
-        dongles.append({"index": i, "tuner": tuner})
-        log_sdr(f"Device {i}: {tuner}")
+        # Fallback: probe tuner with rtl_433 if rtl_eeprom didn't find it
+        if tuner == "unknown":
+            try:
+                result = subprocess.run(
+                    ["rtl_433", "-d", str(i), "-T", "0"],
+                    capture_output=True, text=True, timeout=5
+                )
+                for line in (result.stdout + result.stderr).split("\n"):
+                    if "Found" in line and "tuner" in line.lower():
+                        tuner = line.split("Found ")[-1].strip()
+                        break
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        dongles.append({"index": i, "tuner": tuner, "serial": serial})
+        log_sdr(f"Device {i}: {tuner}  serial={serial or 'none'}")
 
     return dongles
 
@@ -1100,36 +1122,41 @@ class TPMSCapture:
 
         log_ok(f"Detected {len(dongles)} RTL-SDR dongle(s)")
 
-        # Smart frequency assignment based on tuner capability.
-        # R820T/R820T2 is the better tuner — assign it to 433 MHz where
-        # most TPMS data comes from. E4000 gets 315 MHz.
-        # If tuners are the same type, just cycle through bands.
-        freq_list = list(FREQ_PRESETS.items())  # [("315MHz", 315M), ("433MHz", 433.92M)]
+        # Frequency assignment priority:
+        # 1. Serial-based mapping (SERIAL_FREQ_MAP) — explicit, survives replug
+        # 2. Tuner-based auto-assignment — R820T → 433MHz, E4000 → 315MHz
+        # 3. Fallback — cycle through bands
+        freq_list = list(FREQ_PRESETS.items())
         assignments = []
+        assigned_indices = set()
 
-        if len(dongles) >= 2:
-            # Check if we have mixed tuners
-            tuner_strs = [d["tuner"].lower() for d in dongles]
-            r820t_indices = [d["index"] for d in dongles if "r820" in d["tuner"].lower()]
-            e4000_indices = [d["index"] for d in dongles if "e4000" in d["tuner"].lower()]
+        # Step 1: Check serial-based mapping
+        for dongle in dongles:
+            serial = dongle.get("serial", "")
+            if serial in SERIAL_FREQ_MAP:
+                label, freq = SERIAL_FREQ_MAP[serial]
+                assignments.append((dongle["index"], freq, label))
+                assigned_indices.add(dongle["index"])
+                log_info(f"Serial mapping: {serial} → {label}")
 
-            if r820t_indices and e4000_indices:
-                # Mixed tuners: put R820T on 433 MHz (better tuner, more data)
-                # and E4000 on 315 MHz
-                assignments.append((r820t_indices[0], 433_920_000, "433MHz"))
-                assignments.append((e4000_indices[0], 315_000_000, "315MHz"))
-                log_info(f"Smart assignment: R820T → 433 MHz, E4000 → 315 MHz")
-            else:
-                # Same tuner types or unknown — just cycle
-                for i, dongle in enumerate(dongles):
+        # Step 2: Assign remaining dongles by tuner type
+        unassigned = [d for d in dongles if d["index"] not in assigned_indices]
+        used_freqs = {a[1] for a in assignments}
+
+        if unassigned:
+            available_freqs = [(l, f) for l, f in freq_list if f not in used_freqs]
+            if not available_freqs:
+                available_freqs = list(freq_list)  # reuse if all taken
+
+            for i, dongle in enumerate(unassigned):
+                if available_freqs:
+                    label, freq = available_freqs[i % len(available_freqs)]
+                else:
                     label, freq = freq_list[i % len(freq_list)]
-                    if len(dongles) > len(freq_list) and i >= len(freq_list):
-                        label = f"{label}-{i}"
-                    assignments.append((dongle["index"], freq, label))
-        else:
-            # Single dongle — assign to 433 MHz (more TPMS data there)
-            assignments.append((dongles[0]["index"], 433_920_000, "433MHz"))
-            log_info("Single dongle — assigned to 433 MHz (primary TPMS band)")
+                if len(unassigned) > len(available_freqs) and i >= len(available_freqs):
+                    label = f"{label}-{dongle['index']}"
+                assignments.append((dongle["index"], freq, label))
+                log_info(f"Auto-assigned device {dongle['index']} ({dongle['tuner']}) → {label}")
 
         print()
         log_info(f"Database: {DB_PATH}")
