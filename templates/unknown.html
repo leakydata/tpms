@@ -27,11 +27,12 @@
                     <th>Pulses</th>
                     <th>Width</th>
                     <th>Raw Hex</th>
+                    <th>Visualize</th>
                     <th>Analysis</th>
                 </tr>
             </thead>
             <tbody id="unknowns-tbody">
-                <tr><td colspan="9" class="empty">Loading...</td></tr>
+                <tr><td colspan="10" class="empty">Loading...</td></tr>
             </tbody>
         </table>
     </div>
@@ -87,6 +88,7 @@ function showAnalysis(id) {
                     Pulses: <strong>${u.pulse_count || '?'}</strong>
                     Width: <strong>${u.width_ms ? u.width_ms.toFixed(2) + ' ms' : '?'}</strong></p>
                     ${u.raw_hex ? '<p style="margin:8px 0"><strong>Raw hex:</strong> <code class="mono" style="word-break:break-all;color:var(--green)">' + u.raw_hex + '</code></p>' : ''}
+                    ${u.triq_url ? '<p style="margin:8px 0"><strong>Visualize:</strong> <a href="' + u.triq_url + '" target="_blank" style="color:var(--cyan)">' + u.triq_url + '</a></p>' : ''}
                     <pre style="background:var(--bg);padding:12px;border-radius:6px;overflow-x:auto;font-size:0.85em;line-height:1.6;color:var(--text-dim);margin-top:12px">${text}</pre>
                 </div>`;
             document.getElementById('analysis-detail').scrollIntoView({behavior: 'smooth'});
@@ -120,10 +122,11 @@ function loadUnknowns(page) {
                     <td>${u.pulse_count || '-'}</td>
                     <td>${u.width_ms ? u.width_ms.toFixed(2) + ' ms' : '-'}</td>
                     <td class="hex-cell" title="${(u.raw_hex || '').replace(/"/g, '&quot;')}">${u.raw_hex || '-'}</td>
+                    <td>${u.triq_url ? '<a href="' + u.triq_url + '" target="_blank" style="color:var(--cyan)">triq.org</a>' : '-'}</td>
                     <td class="dim">${truncate(u.analysis_text, 60)}</td>
                 </tr>`;
             }
-            document.getElementById('unknowns-tbody').innerHTML = html || '<tr><td colspan="9" class="empty">No unknown signals recorded yet. Signals that can\'t be decoded by any known protocol will appear here.</td></tr>';
+            document.getElementById('unknowns-tbody').innerHTML = html || '<tr><td colspan="10" class="empty">No unknown signals recorded yet. Signals that can\'t be decoded by any known protocol will appear here.</td></tr>';
 
             let pag = '';
             if (data.pages > 0) {

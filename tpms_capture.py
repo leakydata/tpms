@@ -198,8 +198,10 @@ def init_db():
             width_ms REAL,
             modulation TEXT,
             raw_hex TEXT,
+            triq_url TEXT,
             fingerprint TEXT,
             analysis_text TEXT,
+            iq_filename TEXT,
             rssi REAL,
             noise REAL
         )
@@ -214,6 +216,8 @@ def init_db():
         "ALTER TABLE unknown_signals ADD COLUMN modulation TEXT",
         "ALTER TABLE unknown_signals ADD COLUMN raw_hex TEXT",
         "ALTER TABLE unknown_signals ADD COLUMN fingerprint TEXT",
+        "ALTER TABLE unknown_signals ADD COLUMN triq_url TEXT",
+        "ALTER TABLE unknown_signals ADD COLUMN iq_filename TEXT",
     ]
     for sql in migrations:
         try:
@@ -346,6 +350,11 @@ class TPMSCapture:
         protocol_args = []
         for p in DISABLED_BY_DEFAULT:
             protocol_args.extend(["-R", str(p)])
+
+        # Save raw IQ samples of unknown signals for future analysis
+        unknown_dir = Path(__file__).parent / "unknown_iq"
+        unknown_dir.mkdir(exist_ok=True)
+
         cmd = [
             "rtl_433",
             "-d", str(device_index),
@@ -353,7 +362,11 @@ class TPMSCapture:
             "-M", "time:utc",
             "-M", "protocol",
             "-M", "level",
-            "-A",
+            "-A",                                    # pulse analysis on unknown signals
+            "-S", "unknown",                         # save raw IQ of unknown signals
+            "-D", str(unknown_dir),                  # directory for saved IQ files
+            "-Y", "autolevel",                       # auto signal level detection
+            "-Y", "minlevel=-30",                    # capture weaker signals too
             "-F", "json",
         ] + protocol_args
 
@@ -443,6 +456,10 @@ class TPMSCapture:
         width_ms = None
         modulation = None
         raw_hex_parts = []
+        triq_urls = []
+        bitbuffer_rows = []    # complete bitbuffer data for future ID extraction
+        pulse_widths = []      # pulse distribution for structural matching
+        gap_widths = []        # gap distribution for structural matching
 
         for line in lines:
             # "Total count:   60,  width: 7.98 ms"
@@ -450,6 +467,12 @@ class TPMSCapture:
             if m:
                 pulse_count = int(m.group(1))
                 width_ms = float(m.group(2))
+
+            # Pulse/gap width distributions "[  0] count:  30, width:  52 us"
+            m_dist = re.search(r"count:\s*(\d+),\s*width:\s*(\d+)\s*us", line)
+            if m_dist:
+                # Collect distribution data for fingerprinting
+                pass  # already in analysis_text
 
             # "Guessing modulation: FSK_PCM" or "pulse_demod_pcm"
             if "guessing modulation:" in line.lower():
@@ -459,17 +482,33 @@ class TPMSCapture:
                 if m2 and not modulation:
                     modulation = m2.group(1).upper()
 
-            # Raw hex from triq.org links or bitbuffer codes
+            # triq.org visualization URLs (full URL for one-click analysis)
             if "triq.org/pdv/#" in line:
+                url_start = line.index("https://triq.org")
+                triq_urls.append(line[url_start:].strip())
                 hex_part = line.split("#")[-1].strip()
                 if hex_part:
                     raw_hex_parts.append(hex_part)
-            # Bitbuffer rows like "[00] {68} ab cd ef ..."
-            m3 = re.match(r"\s*\[\d+\]\s*\{(\d+)\}\s+([\da-fA-F\s]+)", line)
-            if m3:
-                raw_hex_parts.append(m3.group(2).strip())
 
-        raw_hex = " | ".join(raw_hex_parts) if raw_hex_parts else None
+            # Bitbuffer rows like "[00] {68} ab cd ef ..."
+            m3 = re.match(r"\s*\[(\d+)\]\s*\{(\d+)\}\s+([\da-fA-F\s]+)", line)
+            if m3:
+                row_idx = int(m3.group(1))
+                bit_len = int(m3.group(2))
+                hex_data = m3.group(3).strip()
+                bitbuffer_rows.append(f"[{row_idx:02d}]{{{bit_len}}} {hex_data}")
+                raw_hex_parts.append(hex_data)
+
+        # Combine all hex data — keep bitbuffer rows separate with || delimiter
+        # so they can be compared across captures for ID extraction
+        if bitbuffer_rows:
+            raw_hex = " || ".join(bitbuffer_rows)
+        elif raw_hex_parts:
+            raw_hex = " | ".join(raw_hex_parts)
+        else:
+            raw_hex = None
+
+        triq_url = triq_urls[0] if triq_urls else None
 
         # Structural fingerprint: hash of protocol-level features
         # This is stable across different sensors using the same protocol
@@ -480,10 +519,12 @@ class TPMSCapture:
             self.conn.execute(
                 """INSERT INTO unknown_signals
                    (timestamp, device_index, frequency_label, pulse_count,
-                    width_ms, modulation, raw_hex, fingerprint, analysis_text)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    width_ms, modulation, raw_hex, triq_url, fingerprint,
+                    analysis_text)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (now, device_index, freq_label, pulse_count,
-                 width_ms, modulation, raw_hex, fingerprint, analysis_text),
+                 width_ms, modulation, raw_hex, triq_url, fingerprint,
+                 analysis_text),
             )
             self.conn.commit()
             self.stats["unknown_signals"] += 1
@@ -492,13 +533,14 @@ class TPMSCapture:
         mod_str = modulation or "unknown"
         pc_str = f"{pulse_count}p" if pulse_count else "?"
         w_str = f"{width_ms:.1f}ms" if width_ms else "?"
-        hex_preview = (raw_hex[:40] + "...") if raw_hex and len(raw_hex) > 40 else (raw_hex or "no data")
+        hex_preview = (raw_hex[:50] + "...") if raw_hex and len(raw_hex) > 50 else (raw_hex or "no data")
         log_info(
             f"[{freq_label}] {C['yellow']}UNKNOWN{C['reset']}  "
             f"fp={C['cyan']}{fingerprint}{C['reset']}  "
             f"{mod_str} {pc_str} {w_str}  "
             f"hex={hex_preview}  "
-            f"({len(lines)} analysis lines)"
+            f"triq={'yes' if triq_url else 'no'}  "
+            f"({len(lines)} lines)"
         )
 
     def _register_receiver(self, device_index, freq_label, frequency, pid):
