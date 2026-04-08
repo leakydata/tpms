@@ -119,7 +119,7 @@ def log_stats(msg):
 def init_db():
     """Create the SQLite database and tables."""
     log_db(f"Opening database: {DB_PATH}")
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     log_db("Set journal_mode=WAL")
 
@@ -269,8 +269,13 @@ class TPMSCapture:
                 continue
             # Classify rtl_433 stderr messages
             lower = line.lower()
-            if "error" in lower or "fail" in lower:
+            if "if you want" in lower:
+                # Informational hint from rtl_433, not an actual error
+                log_sdr(f"[{freq_label}] {line}")
+            elif "error" in lower or "fail" in lower:
                 log_error(f"[{freq_label}] {line}")
+            elif "pll not locked" in lower:
+                log_warn(f"[{freq_label}] {line} (usually harmless at startup)")
             elif "warning" in lower or "warn" in lower:
                 log_warn(f"[{freq_label}] {line}")
             else:
