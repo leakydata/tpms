@@ -351,10 +351,6 @@ class TPMSCapture:
         for p in DISABLED_BY_DEFAULT:
             protocol_args.extend(["-R", str(p)])
 
-        # Save raw IQ samples of unknown signals for future analysis
-        unknown_dir = Path(__file__).parent / "unknown_iq"
-        unknown_dir.mkdir(exist_ok=True)
-
         cmd = [
             "rtl_433",
             "-d", str(device_index),
@@ -363,8 +359,7 @@ class TPMSCapture:
             "-M", "protocol",
             "-M", "level",
             "-A",                                    # pulse analysis on unknown signals
-            "-S", "unknown",                         # save raw IQ of unknown signals
-            "-D", str(unknown_dir),                  # directory for saved IQ files
+            "-S", "unknown",                         # save raw IQ of unknown signals to cwd
             "-Y", "autolevel",                       # auto signal level detection
             "-Y", "minlevel=-30",                    # capture weaker signals too
             "-F", "json",
@@ -813,10 +808,14 @@ class TPMSCapture:
         log_sdr(f"[{freq_label}] Launching rtl_433 on device {device_index}")
         log_sdr(f"[{freq_label}] Command: {' '.join(cmd)}")
 
+        # Run rtl_433 with cwd=unknown_iq so -S unknown saves IQ files there
+        iq_dir = Path(__file__).parent / "unknown_iq"
+        iq_dir.mkdir(exist_ok=True)
+
         try:
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, bufsize=1,
+                text=True, bufsize=1, cwd=str(iq_dir),
             )
         except FileNotFoundError:
             log_error(f"[{freq_label}] rtl_433 not found!")
