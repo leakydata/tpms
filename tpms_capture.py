@@ -511,13 +511,30 @@ def extract_sensor_fields(data: dict) -> dict:
 
 
 def is_tpms(data: dict) -> bool:
-    """Check if a decoded message is a TPMS reading."""
+    """Check if a decoded message is a TPMS reading.
+
+    Uses three detection methods to maximize coverage:
+    1. The "type" field — rtl_433 sets this to "TPMS" for known tire sensors
+    2. Model name keywords — catches decoders not using the type field
+    3. Known protocol numbers — hardcoded fallback list
+    """
+    # Method 1: explicit type field (most reliable)
+    if data.get("type", "").upper() == "TPMS":
+        return True
+    # Method 2: model name keywords
     model = data.get("model", "").lower()
-    if any(kw in model for kw in ("tpms", "tire", "tyre", "pressure")):
+    if any(kw in model for kw in ("tpms", "tire", "tyre", "schrader", "pmv-107",
+                                   "steelmate", "jansite", "eez", "tyreguard")):
         return True
+    # Method 3: known protocol number
     proto = data.get("protocol")
-    if proto and int(proto) in TPMS_PROTOCOLS:
+    if proto is not None and int(proto) in TPMS_PROTOCOLS:
         return True
+    # Method 4: has pressure_kPa or pressure_PSI field (heuristic for unknown protocols)
+    if "pressure_kPa" in data or "pressure_PSI" in data or "pressure_bar" in data:
+        # Could be a weather station — check it also has an ID but no humidity
+        if ("id" in data or "ID" in data) and "humidity" not in data:
+            return True
     return False
 
 
