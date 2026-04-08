@@ -10,6 +10,7 @@ dependencies = [
 
 [project.scripts]
 tpms-capture = "tpms_capture:main"
+tpms-web = "tpms_web:main"
 tpms-analyze = "tpms_analyze:main"
 
 [build-system]

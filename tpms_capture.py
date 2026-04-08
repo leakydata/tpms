@@ -2,7 +2,10 @@
 """
 TPMS Sensor Capture Tool
 Captures tire pressure monitoring system (TPMS) broadcasts from passing vehicles
-using rtl_433 and two RTL-SDR dongles (315 MHz + 433.92 MHz).
+using rtl_433 and RTL-SDR dongles (315 MHz + 433.92 MHz).
+
+Stores ALL decoded signals for analysis, with TPMS-specific enrichment.
+Supports any number of RTL-SDR dongles (use a powered USB hub).
 
 For research on anti-stalking / vehicle tracking privacy.
 """
@@ -21,92 +24,54 @@ from collections import defaultdict
 
 DB_PATH = Path(__file__).parent / "tpms_data.db"
 
-# Known TPMS protocol numbers in rtl_433 (used for identification alongside
-# the "type":"TPMS" JSON field and model name keyword matching).
+# Known TPMS protocol numbers in rtl_433.
 TPMS_PROTOCOLS = {
-    59,   # Steelmate TPMS
-    60,   # Schrader TPMS
-    82,   # Citroen TPMS
-    88,   # Toyota TPMS
-    89,   # Ford TPMS
-    90,   # Renault TPMS
-    95,   # Schrader TPMS EG53MA4, Saab, Opel, Vauxhall, Chevrolet
-    110,  # PMV-107J (Toyota) TPMS
-    123,  # Jansite TPMS Model TY02S (disabled by default)
-    140,  # Elantra2012 TPMS
-    156,  # Abarth 124 Spider TPMS
-    168,  # Schrader TPMS SMD3MA4 (Subaru) 3039 (Infiniti, Nissan, Renault)
-    180,  # Jansite TPMS Model Solar
-    186,  # Hyundai TPMS (VDO)
-    201,  # Unbranded SolarTPMS for trucks
-    203,  # Porsche Boxster/Cayman TPMS
-    208,  # AVE TPMS
-    212,  # Renault 0435R TPMS
-    225,  # TyreGuard 400 TPMS
-    226,  # Kia TPMS (-s 1000k for dedicated capture)
-    241,  # EezTire E618, Carchet TPMS, TST-507 TPMS
-    248,  # Nissan TPMS (disabled by default)
-    252,  # BMW Gen4-Gen5 / Audi / HUF/Beru / Continental / Schrader/Sensata
-    257,  # BMW Gen2 and Gen3 TPMS
-    275,  # GM-Aftermarket TPMS
-    295,  # Airpuxem TPMS TYH11_EU6_ZQ
-    298,  # TRW TPMS OOK OEM and Clone models
-    299,  # TRW TPMS FSK OEM and Clone models
+    59, 60, 82, 88, 89, 90, 95, 110, 123, 140, 156, 168, 180, 186,
+    201, 203, 208, 212, 225, 226, 241, 248, 252, 257, 275, 295, 298, 299,
 }
 
-# Protocols that are disabled by default in rtl_433 and must be explicitly
-# enabled with -R.
+# Protocols disabled by default in rtl_433 — we enable them all.
 DISABLED_BY_DEFAULT = [
     6, 7, 13, 14, 24, 37, 48, 61, 62, 64, 72, 86, 101, 106, 107,
     117, 118, 123, 129, 150, 162, 169, 198, 200, 216, 233, 242, 245,
     248, 260, 270,
 ]
 
+# Frequency presets for TPMS bands
+FREQ_PRESETS = {
+    "315MHz": 315_000_000,   # North America
+    "433MHz": 433_920_000,   # Europe / aftermarket
+}
+
 # ── Logging helpers ──────────────────────────────────────────────────────────
 
 COLORS = {
-    "reset":   "\033[0m",
-    "bold":    "\033[1m",
-    "dim":     "\033[2m",
-    "red":     "\033[31m",
-    "green":   "\033[32m",
-    "yellow":  "\033[33m",
-    "blue":    "\033[34m",
-    "magenta": "\033[35m",
-    "cyan":    "\033[36m",
-    "white":   "\033[37m",
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m",
+    "blue": "\033[34m", "magenta": "\033[35m", "cyan": "\033[36m",
+    "white": "\033[37m",
 }
-
 if not sys.stdout.isatty():
     COLORS = {k: "" for k in COLORS}
-
 C = COLORS
-
 
 def _ts():
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 def log_info(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['cyan']}INFO{C['reset']}  {msg}", flush=True)
-
 def log_ok(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['green']}  OK{C['reset']}  {msg}", flush=True)
-
 def log_warn(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['yellow']}WARN{C['reset']}  {msg}", flush=True)
-
 def log_error(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['red']}ERROR{C['reset']} {msg}", flush=True)
-
 def log_rx(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['green']}  RX{C['reset']}  {msg}", flush=True)
-
 def log_db(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['magenta']}  DB{C['reset']}  {msg}", flush=True)
-
 def log_sdr(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['blue']} SDR{C['reset']}  {msg}", flush=True)
-
 def log_stats(msg):
     print(f"{C['dim']}[{_ts()}]{C['reset']} {C['white']}{C['bold']}STAT{C['reset']}  {msg}", flush=True)
 
@@ -119,9 +84,30 @@ def init_db():
     conn.execute("PRAGMA journal_mode=WAL")
     log_db("Set journal_mode=WAL")
 
+    # All decoded signals (TPMS and non-TPMS)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            device_index INTEGER,
+            frequency_mhz REAL,
+            frequency_label TEXT,
+            protocol INTEGER,
+            model TEXT,
+            type TEXT,
+            sensor_id TEXT,
+            rssi REAL,
+            snr REAL,
+            noise REAL,
+            raw_json TEXT NOT NULL
+        )
+    """)
+
+    # TPMS-specific readings (enriched subset of signals)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS readings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER REFERENCES signals(id),
             timestamp TEXT NOT NULL,
             frequency_mhz REAL,
             protocol TEXT,
@@ -134,6 +120,28 @@ def init_db():
             raw_json TEXT NOT NULL
         )
     """)
+
+    # Per-sensor tracking
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sensors (
+            sensor_id TEXT PRIMARY KEY,
+            model TEXT,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            reading_count INTEGER DEFAULT 1,
+            min_pressure_kpa REAL,
+            max_pressure_kpa REAL,
+            min_temperature_c REAL,
+            max_temperature_c REAL,
+            last_pressure_kpa REAL,
+            last_temperature_c REAL,
+            last_battery_ok INTEGER,
+            last_rssi REAL,
+            notes TEXT
+        )
+    """)
+
+    # Vehicle groups
     conn.execute("""
         CREATE TABLE IF NOT EXISTS vehicles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,17 +153,23 @@ def init_db():
             notes TEXT
         )
     """)
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_model ON signals(model)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_sensor_id ON signals(sensor_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_sensor_id ON readings(sensor_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_readings_timestamp ON readings(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_vehicles_hash ON vehicles(vehicle_hash)")
     conn.commit()
 
+    cur = conn.execute("SELECT COUNT(*) FROM signals")
+    total_signals = cur.fetchone()[0]
     cur = conn.execute("SELECT COUNT(*) FROM readings")
-    existing = cur.fetchone()[0]
-    cur = conn.execute("SELECT COUNT(DISTINCT sensor_id) FROM readings")
-    existing_sensors = cur.fetchone()[0]
-    if existing > 0:
-        log_db(f"Existing data: {existing} readings, {existing_sensors} unique sensors")
+    total_readings = cur.fetchone()[0]
+    cur = conn.execute("SELECT COUNT(*) FROM sensors")
+    total_sensors = cur.fetchone()[0]
+    if total_signals > 0:
+        log_db(f"Existing data: {total_signals} signals, {total_readings} TPMS readings, {total_sensors} sensors")
     else:
         log_db("Database initialized (empty — fresh start)")
 
@@ -166,20 +180,11 @@ def init_db():
 
 def extract_sensor_fields(data: dict) -> dict:
     sensor_id = str(
-        data.get("id")
-        or data.get("ID")
-        or data.get("sensor_id")
-        or data.get("code")
-        or data.get("address")
-        or ""
+        data.get("id") or data.get("ID") or data.get("sensor_id")
+        or data.get("code") or data.get("address") or ""
     )
 
-    pressure = (
-        data.get("pressure_kPa")
-        or data.get("pressure_PSI")
-        or data.get("pressure_bar")
-        or None
-    )
+    pressure = data.get("pressure_kPa") or data.get("pressure_PSI") or data.get("pressure_bar") or None
     if pressure is not None:
         if "pressure_PSI" in data and "pressure_kPa" not in data:
             pressure = float(pressure) * 6.89476
@@ -211,7 +216,6 @@ def extract_sensor_fields(data: dict) -> dict:
 
 
 def is_tpms(data: dict) -> bool:
-    """Check if a decoded message is a TPMS reading."""
     if data.get("type", "").upper() == "TPMS":
         return True
     model = data.get("model", "").lower()
@@ -227,6 +231,24 @@ def is_tpms(data: dict) -> bool:
     return False
 
 
+def detect_dongles():
+    """Auto-detect connected RTL-SDR dongles."""
+    try:
+        result = subprocess.run(
+            ["rtl_test", "-t"], capture_output=True, text=True, timeout=5
+        )
+        output = result.stdout + result.stderr
+        for line in output.split("\n"):
+            if line.strip().startswith("Found"):
+                import re
+                m = re.search(r"Found (\d+) device", line)
+                if m:
+                    return int(m.group(1))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return 0
+
+
 # ── Main capture class ───────────────────────────────────────────────────────
 
 class TPMSCapture:
@@ -238,24 +260,21 @@ class TPMSCapture:
         self.stats = defaultdict(int)
         self.unique_sensors = set()
         self.sensor_models = {}
-        self.sensor_last_seen = {}
         self.start_time = datetime.now(timezone.utc)
         self.last_status_time = time.monotonic()
         self.stderr_threads = []
-        # Duplicate detection: buffer decodes that share timestamp+RSSI
         self._decode_buffer = []
         self._decode_buffer_key = None
         self._decode_flush_timer = None
 
-    def build_rtl433_cmd(self, device_index: int, frequency: float) -> list:
+    def build_rtl433_cmd(self, device_index: int, frequency: int) -> list:
         protocol_args = []
         for p in DISABLED_BY_DEFAULT:
             protocol_args.extend(["-R", str(p)])
-
         return [
             "rtl_433",
             "-d", str(device_index),
-            "-f", str(int(frequency)),
+            "-f", str(frequency),
             "-M", "time:utc",
             "-M", "protocol",
             "-M", "level",
@@ -283,72 +302,132 @@ class TPMSCapture:
         score = 0
         temp = fields["temperature_c"]
         if temp is not None:
-            if -10 <= temp <= 80:
-                score += 10
-            else:
-                score -= 20
+            score += 10 if -10 <= temp <= 80 else -20
         pres = fields["pressure_kpa"]
         if pres is not None:
-            if 100 <= pres <= 400:
-                score += 5
-            else:
-                score -= 10
+            score += 5 if 100 <= pres <= 400 else -10
         return score
 
     def _flush_decode_buffer(self):
         if not self._decode_buffer:
             return
-
         buf = self._decode_buffer
         self._decode_buffer = []
         self._decode_buffer_key = None
 
-        if len(buf) == 1:
-            self._commit_decode(*buf[0])
+        # Group by TPMS vs non-TPMS
+        tpms_decodes = [(d, f, fl) for d, f, fl in buf if is_tpms(d)]
+        non_tpms = [(d, f, fl) for d, f, fl in buf if not is_tpms(d)]
+
+        # Store all non-TPMS signals
+        for data, fields, freq_label in non_tpms:
+            self._store_signal(data, freq_label)
+
+        if len(tpms_decodes) == 0:
+            pass
+        elif len(tpms_decodes) == 1:
+            self._commit_tpms(*tpms_decodes[0])
         else:
-            scored = [(self._score_decode(fields), data, fields, fl) for data, fields, fl in buf]
+            scored = [(self._score_decode(f), d, f, fl) for d, f, fl in tpms_decodes]
             scored.sort(key=lambda x: x[0], reverse=True)
             _, best_data, best_fields, best_fl = scored[0]
-            self._commit_decode(best_data, best_fields, best_fl)
+            self._commit_tpms(best_data, best_fields, best_fl)
             suppressed = [s[1].get("model", "?") for s in scored[1:]]
             if suppressed:
-                log_info(f"DEDUP: suppressed {len(suppressed)} duplicate decode(s): {', '.join(suppressed)}")
+                log_info(f"DEDUP: suppressed {len(suppressed)} duplicate(s): {', '.join(suppressed)}")
 
-    def _commit_decode(self, data, fields, freq_label):
+    def _store_signal(self, data, freq_label, device_index=None):
+        """Store any decoded signal in the signals table."""
+        timestamp = data.get("time", datetime.now(timezone.utc).isoformat())
+        sensor_id = str(data.get("id") or data.get("ID") or data.get("sensor_id")
+                        or data.get("code") or data.get("address") or "")
+        with self.lock:
+            self.conn.execute(
+                """INSERT INTO signals
+                   (timestamp, device_index, frequency_mhz, frequency_label,
+                    protocol, model, type, sensor_id, rssi, snr, noise, raw_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    timestamp, device_index, data.get("freq"),
+                    freq_label, data.get("protocol"), data.get("model"),
+                    data.get("type", ""), sensor_id,
+                    data.get("rssi"), data.get("snr"), data.get("noise"),
+                    json.dumps(data),
+                ),
+            )
+            self.conn.commit()
+            self.stats["total_signals"] += 1
+
+    def _commit_tpms(self, data, fields, freq_label):
+        """Store a TPMS decode in both signals and readings tables, update sensor."""
         timestamp = data.get("time", datetime.now(timezone.utc).isoformat())
         model = data.get("model", "unknown")
         protocol = data.get("protocol", "")
         freq_mhz = data.get("freq", None)
-        snr = data.get("snr", None)
         rssi = data.get("rssi", None)
+        snr = data.get("snr", None)
         noise = data.get("noise", None)
+        sid = fields["sensor_id"]
 
-        is_new_sensor = fields["sensor_id"] not in self.unique_sensors
+        is_new = sid not in self.unique_sensors
 
         with self.lock:
+            # Store in signals table
+            cur = self.conn.execute(
+                """INSERT INTO signals
+                   (timestamp, frequency_mhz, frequency_label, protocol, model,
+                    type, sensor_id, rssi, snr, noise, raw_json)
+                   VALUES (?, ?, ?, ?, ?, 'TPMS', ?, ?, ?, ?, ?)""",
+                (timestamp, freq_mhz, freq_label, protocol, model,
+                 sid, rssi, snr, noise, json.dumps(data)),
+            )
+            signal_id = cur.lastrowid
+
+            # Store in TPMS readings table
             self.conn.execute(
                 """INSERT INTO readings
-                   (timestamp, frequency_mhz, protocol, model, sensor_id,
+                   (signal_id, timestamp, frequency_mhz, protocol, model, sensor_id,
                     pressure_kpa, temperature_c, battery_ok, flags, raw_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    timestamp, freq_mhz, str(protocol), model,
-                    fields["sensor_id"], fields["pressure_kpa"],
-                    fields["temperature_c"], fields["battery_ok"],
-                    fields["flags"], json.dumps(data),
-                ),
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (signal_id, timestamp, freq_mhz, str(protocol), model, sid,
+                 fields["pressure_kpa"], fields["temperature_c"],
+                 fields["battery_ok"], fields["flags"], json.dumps(data)),
             )
+
+            # Upsert sensor record
+            self.conn.execute("""
+                INSERT INTO sensors
+                    (sensor_id, model, first_seen, last_seen, reading_count,
+                     min_pressure_kpa, max_pressure_kpa, min_temperature_c, max_temperature_c,
+                     last_pressure_kpa, last_temperature_c, last_battery_ok, last_rssi)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sensor_id) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    reading_count = reading_count + 1,
+                    min_pressure_kpa = MIN(COALESCE(min_pressure_kpa, excluded.min_pressure_kpa), excluded.min_pressure_kpa),
+                    max_pressure_kpa = MAX(COALESCE(max_pressure_kpa, excluded.max_pressure_kpa), excluded.max_pressure_kpa),
+                    min_temperature_c = MIN(COALESCE(min_temperature_c, excluded.min_temperature_c), excluded.min_temperature_c),
+                    max_temperature_c = MAX(COALESCE(max_temperature_c, excluded.max_temperature_c), excluded.max_temperature_c),
+                    last_pressure_kpa = COALESCE(excluded.last_pressure_kpa, last_pressure_kpa),
+                    last_temperature_c = COALESCE(excluded.last_temperature_c, last_temperature_c),
+                    last_battery_ok = COALESCE(excluded.last_battery_ok, last_battery_ok),
+                    last_rssi = COALESCE(excluded.last_rssi, last_rssi)
+            """, (sid, model, timestamp, timestamp,
+                  fields["pressure_kpa"], fields["pressure_kpa"],
+                  fields["temperature_c"], fields["temperature_c"],
+                  fields["pressure_kpa"], fields["temperature_c"],
+                  fields["battery_ok"], rssi))
+
             self.conn.commit()
 
+            self.stats["total_signals"] += 1
             self.stats["total_readings"] += 1
             self.stats[f"readings_{freq_label}"] += 1
-            self.unique_sensors.add(fields["sensor_id"])
+            self.unique_sensors.add(sid)
             self.stats["unique_sensors"] = len(self.unique_sensors)
-            self.sensor_models[fields["sensor_id"]] = model
-            self.sensor_last_seen[fields["sensor_id"]] = timestamp
+            self.sensor_models[sid] = model
 
         # Build log line
-        sid = fields["sensor_id"]
         parts = [f"[{freq_label}] {C['bold']}{model}{C['reset']}  id={C['cyan']}{sid}{C['reset']}"]
         if fields["pressure_kpa"]:
             parts.append(f"pressure={fields['pressure_kpa']:.1f}kPa ({fields['pressure_kpa']/6.89476:.1f}psi)")
@@ -368,18 +447,16 @@ class TPMSCapture:
             parts.append(f"freq={freq_mhz:.3f}MHz")
         parts.append(f"proto={protocol}")
 
-        new_tag = f"  {C['yellow']}** NEW SENSOR **{C['reset']}" if is_new_sensor else ""
+        new_tag = f"  {C['yellow']}** NEW SENSOR **{C['reset']}" if is_new else ""
         log_rx("  ".join(parts) + new_tag)
 
-        if is_new_sensor:
-            log_db(f"Stored new sensor {sid} ({model}) — "
-                   f"{self.stats['unique_sensors']} unique sensors total")
+        if is_new:
+            log_db(f"New sensor {sid} ({model}) — {self.stats['unique_sensors']} unique total")
 
     def process_line(self, line: str, freq_label: str):
         line = line.strip()
         if not line:
             return
-
         try:
             data = json.loads(line)
         except json.JSONDecodeError:
@@ -387,8 +464,15 @@ class TPMSCapture:
             return
 
         model = data.get("model", "unknown")
-        if not is_tpms(data):
-            log_info(f"[{freq_label}] Ignored non-TPMS decode: model={model}")
+        is_tpms_signal = is_tpms(data)
+
+        if not is_tpms_signal:
+            # Still store non-TPMS signals
+            self._store_signal(data, freq_label)
+            self.stats["non_tpms_signals"] += 1
+            # Log occasionally (not every single one to avoid spam)
+            if self.stats["non_tpms_signals"] % 100 == 1:
+                log_info(f"[{freq_label}] Non-TPMS signal: model={model} (total non-TPMS: {self.stats['non_tpms_signals']})")
             return
 
         fields = extract_sensor_fields(data)
@@ -408,7 +492,7 @@ class TPMSCapture:
         self._decode_flush_timer.daemon = True
         self._decode_flush_timer.start()
 
-    def run_receiver(self, device_index: int, frequency: float, freq_label: str):
+    def run_receiver(self, device_index: int, frequency: int, freq_label: str):
         cmd = self.build_rtl433_cmd(device_index, frequency)
         log_sdr(f"[{freq_label}] Launching rtl_433 on device {device_index}")
         log_sdr(f"[{freq_label}] Command: {' '.join(cmd)}")
@@ -419,7 +503,7 @@ class TPMSCapture:
                 text=True, bufsize=1,
             )
         except FileNotFoundError:
-            log_error(f"[{freq_label}] rtl_433 not found! Install it first.")
+            log_error(f"[{freq_label}] rtl_433 not found!")
             return
         except Exception as e:
             log_error(f"[{freq_label}] Failed to start rtl_433: {e}")
@@ -433,15 +517,14 @@ class TPMSCapture:
         )
         stderr_t.start()
         self.stderr_threads.append(stderr_t)
-        log_info(f"[{freq_label}] Listening for TPMS signals...")
+        log_info(f"[{freq_label}] Listening for signals...")
 
         while self.running:
             line = proc.stdout.readline()
             if not line:
                 if proc.poll() is not None:
-                    exit_code = proc.returncode
-                    if exit_code != 0 and self.running:
-                        log_error(f"[{freq_label}] rtl_433 exited with code {exit_code}")
+                    if proc.returncode != 0 and self.running:
+                        log_error(f"[{freq_label}] rtl_433 exited with code {proc.returncode}")
                     break
                 continue
             self.process_line(line, freq_label)
@@ -454,14 +537,19 @@ class TPMSCapture:
         mins = int(elapsed // 60)
         secs = int(elapsed % 60)
         alive = sum(1 for p in self.processes if p.poll() is None)
+        total_receivers = len(self.processes)
         r315 = self.stats.get("readings_315MHz", 0)
         r433 = self.stats.get("readings_433MHz", 0)
         est_v = max(1, self.stats["unique_sensors"] // 4) if self.stats["unique_sensors"] > 0 else 0
 
         log_stats(
-            f"uptime={mins:02d}:{secs:02d}  receivers={alive}/2  "
-            f"readings={self.stats['total_readings']} (315:{r315} 433:{r433})  "
-            f"unique_sensors={self.stats['unique_sensors']}  est_vehicles=~{est_v}"
+            f"uptime={mins:02d}:{secs:02d}  "
+            f"receivers={alive}/{total_receivers}  "
+            f"signals={self.stats.get('total_signals', 0)}  "
+            f"tpms_readings={self.stats['total_readings']} (315:{r315} 433:{r433})  "
+            f"non_tpms={self.stats.get('non_tpms_signals', 0)}  "
+            f"sensors={self.stats['unique_sensors']}  "
+            f"est_vehicles=~{est_v}"
         )
 
     def correlate_vehicles(self):
@@ -476,9 +564,7 @@ class TPMSCapture:
             log_warn("No sensors captured — nothing to correlate")
             return
 
-        groups = []
-        current_group = []
-        current_time = None
+        groups, current_group, current_time = [], [], None
         for sid, first_seen, last_seen, count, model in sensors:
             t = datetime.fromisoformat(first_seen)
             if current_time is None or (t - current_time).total_seconds() < 30:
@@ -502,8 +588,7 @@ class TPMSCapture:
                 INSERT INTO vehicles (vehicle_hash, sensor_ids, first_seen, last_seen, sighting_count)
                 VALUES (?, ?, ?, ?, 1)
                 ON CONFLICT(vehicle_hash) DO UPDATE SET
-                    last_seen = excluded.last_seen,
-                    sighting_count = sighting_count + 1
+                    last_seen = excluded.last_seen, sighting_count = sighting_count + 1
             """, (vehicle_hash, json.dumps(sensor_ids), first_seen, last_seen))
         self.conn.commit()
         log_ok(f"Correlated into {len(groups)} potential vehicle group(s)")
@@ -517,16 +602,18 @@ class TPMSCapture:
 
     def print_summary(self):
         elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
-        mins = int(elapsed // 60)
-        secs = int(elapsed % 60)
+        mins, secs = int(elapsed // 60), int(elapsed % 60)
+        est = max(1, self.stats['unique_sensors'] // 4) if self.stats['unique_sensors'] > 0 else 0
 
         print(f"\n{C['bold']}{'='*70}{C['reset']}")
         print(f"{C['bold']}  TPMS Capture Session Summary{C['reset']}")
         print(f"{C['bold']}{'='*70}{C['reset']}")
         print(f"  Duration:           {mins}m {secs}s")
-        print(f"  Total readings:     {self.stats['total_readings']}")
-        print(f"  Unique sensor IDs:  {self.stats['unique_sensors']}")
-        print(f"  Est. vehicles:      ~{max(1, self.stats['unique_sensors'] // 4) if self.stats['unique_sensors'] > 0 else 0}")
+        print(f"  Total signals:      {self.stats.get('total_signals', 0)}")
+        print(f"  TPMS readings:      {self.stats['total_readings']}")
+        print(f"  Non-TPMS signals:   {self.stats.get('non_tpms_signals', 0)}")
+        print(f"  Unique TPMS sensors:{self.stats['unique_sensors']}")
+        print(f"  Est. vehicles:      ~{est}")
         print(f"  315 MHz readings:   {self.stats.get('readings_315MHz', 0)}")
         print(f"  433 MHz readings:   {self.stats.get('readings_433MHz', 0)}")
         print(f"  Database:           {DB_PATH}")
@@ -576,25 +663,9 @@ class TPMSCapture:
 
         try:
             ver = subprocess.run(["rtl_433", "-V"], capture_output=True, text=True, timeout=5)
-            version_line = (ver.stdout + ver.stderr).strip().split("\n")[0]
-            log_ok(f"rtl_433 version: {version_line}")
+            log_ok(f"rtl_433 version: {(ver.stdout + ver.stderr).strip().split(chr(10))[0]}")
         except Exception:
             log_warn("Could not determine rtl_433 version")
-
-        try:
-            result = subprocess.run(["rtl_test", "-t"], capture_output=True, text=True, timeout=5)
-            output = result.stdout + result.stderr
-            if "Found 0 device" in output:
-                log_error("No RTL-SDR devices found!")
-                return False
-            for line in output.split("\n"):
-                line = line.strip()
-                if line.startswith("Found") or "Realtek" in line or "Using device" in line:
-                    log_sdr(line)
-        except FileNotFoundError:
-            log_warn("rtl_test not available — skipping device check")
-        except subprocess.TimeoutExpired:
-            log_ok("RTL-SDR devices detected (rtl_test responded)")
 
         return True
 
@@ -610,28 +681,40 @@ class TPMSCapture:
             log_error("Prerequisites not met — exiting")
             sys.exit(1)
 
+        # Auto-detect dongles
+        n_dongles = detect_dongles()
+        if n_dongles == 0:
+            log_warn("No RTL-SDR devices detected — will try to start anyway")
+            n_dongles = 2  # try the default 2
+
+        log_ok(f"Detected {n_dongles} RTL-SDR dongle(s)")
+
+        # Assign frequencies: cycle through bands
+        freq_list = list(FREQ_PRESETS.items())
+        assignments = []
+        for i in range(n_dongles):
+            label, freq = freq_list[i % len(freq_list)]
+            if n_dongles > len(freq_list) and i >= len(freq_list):
+                label = f"{label}-{i}"
+            assignments.append((i, freq, label))
+
         print()
         log_info(f"Database: {DB_PATH}")
-        log_info(f"All protocols enabled ({len(TPMS_PROTOCOLS)} known TPMS + auto-detect)")
-        log_info(f"Device 0 (E4000):  315.000 MHz (North America)")
-        log_info(f"Device 1 (R820T):  433.920 MHz (Europe/aftermarket)")
+        log_info(f"All {317} protocols enabled (all signals stored, TPMS enriched)")
+        for dev_idx, freq, label in assignments:
+            log_info(f"Device {dev_idx}: {freq/1e6:.3f} MHz ({label})")
         log_info(f"Web dashboard: uv run tpms-web")
         log_info(f"Press Ctrl+C to stop and see summary")
         print()
 
-        t315 = threading.Thread(
-            target=self.run_receiver, args=(0, 315_000_000, "315MHz"),
-            daemon=True, name="receiver-315MHz",
-        )
-        t433 = threading.Thread(
-            target=self.run_receiver, args=(1, 433_920_000, "433MHz"),
-            daemon=True, name="receiver-433MHz",
-        )
-
-        t315.start()
-        log_ok("315 MHz receiver thread started")
-        t433.start()
-        log_ok("433 MHz receiver thread started")
+        # Start receivers
+        for dev_idx, freq, label in assignments:
+            t = threading.Thread(
+                target=self.run_receiver, args=(dev_idx, freq, label),
+                daemon=True, name=f"receiver-{label}",
+            )
+            t.start()
+            log_ok(f"{label} receiver thread started (device {dev_idx})")
         print()
 
         try:

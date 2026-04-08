@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+{% block title %}TPMS Dashboard{% endblock %}
+{% block content %}
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:24px">
+    <h1 style="font-size:1.5em">Dashboard</h1>
+    <span class="live-dot"></span>
+    <span class="dim" id="live-status">Connecting...</span>
+</div>
+
+<div class="stats-grid" id="stats-cards">
+    <div class="stat-card"><div class="label">Total Signals</div><div class="value cyan" id="stat-signals">-</div></div>
+    <div class="stat-card"><div class="label">TPMS Readings</div><div class="value green" id="stat-readings">-</div></div>
+    <div class="stat-card"><div class="label">Unique Sensors</div><div class="value yellow" id="stat-sensors">-</div></div>
+    <div class="stat-card"><div class="label">Est. Vehicles</div><div class="value magenta" id="stat-vehicles">-</div></div>
+    <div class="stat-card"><div class="label">315 MHz</div><div class="value" id="stat-315" style="color:var(--text)">-</div></div>
+    <div class="stat-card"><div class="label">433 MHz</div><div class="value" id="stat-433" style="color:var(--text)">-</div></div>
+</div>
+
+<div class="two-col">
+    <div class="card">
+        <h2>Live Feed</h2>
+        <div style="max-height:500px;overflow-y:auto" id="live-feed">
+            <table>
+                <thead>
+                    <tr><th>Time</th><th>Band</th><th>Protocol</th><th>Sensor ID</th><th>Pressure</th><th>Temp</th><th>RSSI</th></tr>
+                </thead>
+                <tbody id="live-tbody">
+                    <tr><td colspan="7" class="empty">Waiting for data...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+    <div>
+        <div class="card">
+            <h2>Protocol Breakdown</h2>
+            <table>
+                <thead><tr><th>Model</th><th>Readings</th><th>Sensors</th></tr></thead>
+                <tbody id="protocols-tbody">
+                    <tr><td colspan="3" class="empty">Loading...</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="card">
+            <h2>Capture Window</h2>
+            <div id="capture-window" class="dim" style="font-size:0.9em">Loading...</div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function formatTime(ts) {
+    if (!ts) return '-';
+    try { return ts.split(' ')[1] || ts.split('T')[1] || ts; }
+    catch(e) { return ts; }
+}
+
+function formatPressure(kpa) {
+    if (kpa == null) return '-';
+    return kpa.toFixed(1) + ' kPa <span class="dim">(' + (kpa / 6.89476).toFixed(1) + ' psi)</span>';
+}
+
+function formatTemp(c) {
+    if (c == null) return '-';
+    return c.toFixed(1) + ' C';
+}
+
+function rssiColor(rssi) {
+    if (rssi == null) return 'var(--text-dim)';
+    if (rssi > -10) return 'var(--green)';
+    if (rssi > -20) return 'var(--yellow)';
+    return 'var(--red)';
+}
+
+function rssiBar(rssi) {
+    if (rssi == null) return '<span class="dim">-</span>';
+    let pct = Math.max(0, Math.min(100, ((rssi + 30) / 30) * 100));
+    let color = rssiColor(rssi);
+    return `<span class="signal-bar" style="width:${pct}px;background:${color}"></span> <span style="color:${color}">${rssi.toFixed(1)}</span>`;
+}
+
+function bandBadge(freq) {
+    if (!freq) return '<span class="badge badge-cyan">?</span>';
+    if (freq < 400) return '<span class="badge badge-green">315</span>';
+    return '<span class="badge badge-cyan">433</span>';
+}
+
+function loadStats() {
+    fetch('/api/stats')
+        .then(r => r.json())
+        .then(data => {
+            document.getElementById('stat-signals').textContent = data.total_signals.toLocaleString();
+            document.getElementById('stat-readings').textContent = data.total_readings.toLocaleString();
+            document.getElementById('stat-sensors').textContent = data.unique_sensors.toLocaleString();
+            document.getElementById('stat-vehicles').textContent = '~' + data.est_vehicles;
+            document.getElementById('stat-315').textContent = data.readings_315.toLocaleString();
+            document.getElementById('stat-433').textContent = data.readings_433.toLocaleString();
+
+            // Protocols table
+            let html = '';
+            for (let p of data.protocols) {
+                html += `<tr><td><span class="mono">${p.model}</span></td><td>${p.readings}</td><td>${p.sensors}</td></tr>`;
+            }
+            document.getElementById('protocols-tbody').innerHTML = html || '<tr><td colspan="3" class="empty">No data yet</td></tr>';
+
+            // Capture window
+            let cw = '';
+            if (data.first_reading) {
+                cw = `First: ${data.first_reading}<br>Last: ${data.last_reading}`;
+            } else {
+                cw = 'No readings yet — is the capture tool running?';
+            }
+            document.getElementById('capture-window').innerHTML = cw;
+        });
+}
+
+// SSE live stream
+let liveRows = [];
+const MAX_LIVE = 100;
+
+function startSSE() {
+    const es = new EventSource('/api/live');
+    const status = document.getElementById('live-status');
+
+    es.onopen = () => { status.textContent = 'Live'; };
+    es.onerror = () => { status.textContent = 'Reconnecting...'; };
+
+    es.onmessage = (e) => {
+        const reading = JSON.parse(e.data);
+        liveRows.unshift(reading);
+        if (liveRows.length > MAX_LIVE) liveRows.pop();
+        renderLive();
+        loadStats();
+    };
+
+    es.addEventListener('stats', (e) => {
+        const s = JSON.parse(e.data);
+        document.getElementById('stat-readings').textContent = s.total_readings.toLocaleString();
+        document.getElementById('stat-sensors').textContent = s.unique_sensors.toLocaleString();
+        document.getElementById('stat-signals').textContent = s.total_signals.toLocaleString();
+    });
+}
+
+function renderLive() {
+    let html = '';
+    for (let r of liveRows) {
+        html += `<tr>
+            <td class="mono dim">${formatTime(r.timestamp)}</td>
+            <td>${bandBadge(r.frequency_mhz)}</td>
+            <td><span class="mono">${r.model || '-'}</span></td>
+            <td><span class="mono" style="color:var(--cyan)">${r.sensor_id || '-'}</span></td>
+            <td>${formatPressure(r.pressure_kpa)}</td>
+            <td>${formatTemp(r.temperature_c)}</td>
+            <td>${rssiBar(null)}</td>
+        </tr>`;
+    }
+    document.getElementById('live-tbody').innerHTML = html || '<tr><td colspan="7" class="empty">Waiting for data...</td></tr>';
+}
+
+loadStats();
+startSSE();
+setInterval(loadStats, 10000);
+</script>
+{% endblock %}

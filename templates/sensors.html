@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}TPMS Sensors{% endblock %}
+{% block content %}
+<h1 style="font-size:1.5em;margin-bottom:24px">Tracked Sensors</h1>
+
+<div class="card">
+    <div style="overflow-x:auto">
+        <table>
+            <thead>
+                <tr>
+                    <th>Sensor ID</th>
+                    <th>Model</th>
+                    <th>Readings</th>
+                    <th>First Seen</th>
+                    <th>Last Seen</th>
+                    <th>Pressure Range (kPa)</th>
+                    <th>Temp Range (C)</th>
+                    <th>Last Pressure</th>
+                    <th>Last Temp</th>
+                    <th>Battery</th>
+                    <th>Last RSSI</th>
+                </tr>
+            </thead>
+            <tbody id="sensors-tbody">
+                <tr><td colspan="11" class="empty">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card" id="vehicles-card">
+    <h2>Vehicle Groups</h2>
+    <p class="dim" style="margin-bottom:12px;font-size:0.9em">Sensors seen within 30 seconds of each other, likely from the same vehicle.</p>
+    <div id="vehicles-content">
+        <div class="empty">Loading...</div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function fmt(v, decimals) {
+    if (v == null || v === undefined) return '-';
+    return Number(v).toFixed(decimals || 1);
+}
+
+function loadSensors() {
+    fetch('/api/sensors')
+        .then(r => r.json())
+        .then(data => {
+            let html = '';
+            for (let s of data.sensors) {
+                let battClass = s.last_battery_ok === 1 ? 'badge-green' : s.last_battery_ok === 0 ? 'badge-red' : '';
+                let battText = s.last_battery_ok === 1 ? 'OK' : s.last_battery_ok === 0 ? 'LOW' : '-';
+
+                let presRange = '-';
+                if (s.min_pressure_kpa != null) {
+                    presRange = `${fmt(s.min_pressure_kpa)} — ${fmt(s.max_pressure_kpa)}`;
+                }
+                let tempRange = '-';
+                if (s.min_temperature_c != null) {
+                    tempRange = `${fmt(s.min_temperature_c)} — ${fmt(s.max_temperature_c)}`;
+                }
+
+                let rssiColor = 'var(--text-dim)';
+                if (s.last_rssi != null) {
+                    if (s.last_rssi > -10) rssiColor = 'var(--green)';
+                    else if (s.last_rssi > -20) rssiColor = 'var(--yellow)';
+                    else rssiColor = 'var(--red)';
+                }
+
+                html += `<tr>
+                    <td class="mono" style="color:var(--cyan)">${s.sensor_id}</td>
+                    <td class="mono">${s.model || '-'}</td>
+                    <td>${s.reading_count}</td>
+                    <td class="mono dim">${s.first_seen || '-'}</td>
+                    <td class="mono dim">${s.last_seen || '-'}</td>
+                    <td>${presRange}</td>
+                    <td>${tempRange}</td>
+                    <td>${fmt(s.last_pressure_kpa)} <span class="dim">(${s.last_pressure_kpa ? (s.last_pressure_kpa / 6.89476).toFixed(1) + ' psi' : ''})</span></td>
+                    <td>${fmt(s.last_temperature_c)}</td>
+                    <td>${battClass ? '<span class="badge ' + battClass + '">' + battText + '</span>' : '-'}</td>
+                    <td style="color:${rssiColor}">${s.last_rssi != null ? s.last_rssi.toFixed(1) + ' dB' : '-'}</td>
+                </tr>`;
+            }
+            document.getElementById('sensors-tbody').innerHTML = html || '<tr><td colspan="11" class="empty">No sensors captured yet</td></tr>';
+        });
+}
+
+function loadVehicles() {
+    fetch('/api/vehicles')
+        .then(r => r.json())
+        .then(data => {
+            if (!data.vehicles.length) {
+                document.getElementById('vehicles-content').innerHTML = '<div class="empty">No vehicle groups yet. Stop and restart capture to trigger correlation.</div>';
+                return;
+            }
+            let html = '<table><thead><tr><th>#</th><th>Sensors</th><th>First Seen</th><th>Last Seen</th><th>Sightings</th></tr></thead><tbody>';
+            data.vehicles.forEach((v, i) => {
+                let sids = v.sensor_ids.map(s => `<span class="mono" style="color:var(--cyan)">${s}</span>`).join(', ');
+                html += `<tr>
+                    <td>${i + 1}</td>
+                    <td>${sids} <span class="dim">(${v.sensor_ids.length} sensor${v.sensor_ids.length > 1 ? 's' : ''})</span></td>
+                    <td class="mono dim">${v.first_seen}</td>
+                    <td class="mono dim">${v.last_seen}</td>
+                    <td>${v.sighting_count}</td>
+                </tr>`;
+            });
+            html += '</tbody></table>';
+            document.getElementById('vehicles-content').innerHTML = html;
+        });
+}
+
+loadSensors();
+loadVehicles();
+setInterval(loadSensors, 10000);
+</script>
+{% endblock %}

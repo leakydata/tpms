@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}TPMS Readings{% endblock %}
+{% block content %}
+<h1 style="font-size:1.5em;margin-bottom:24px">TPMS Readings</h1>
+
+<div class="card">
+    <div class="filters">
+        <input type="text" id="filter-model" placeholder="Filter by model..." oninput="loadReadings(1)">
+        <input type="text" id="filter-sensor" placeholder="Filter by sensor ID..." oninput="loadReadings(1)">
+    </div>
+    <div style="overflow-x:auto">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Timestamp</th>
+                    <th>Band</th>
+                    <th>Protocol</th>
+                    <th>Model</th>
+                    <th>Sensor ID</th>
+                    <th>Pressure (kPa)</th>
+                    <th>Pressure (psi)</th>
+                    <th>Temp (C)</th>
+                    <th>Battery</th>
+                    <th>Flags</th>
+                </tr>
+            </thead>
+            <tbody id="readings-tbody">
+                <tr><td colspan="11" class="empty">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div class="pagination" id="pagination"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentPage = 1;
+
+function loadReadings(page) {
+    currentPage = page || 1;
+    const model = document.getElementById('filter-model').value;
+    const sensor = document.getElementById('filter-sensor').value;
+    const params = new URLSearchParams({page: currentPage, per_page: 50});
+    if (model) params.set('model', model);
+    if (sensor) params.set('sensor_id', sensor);
+
+    fetch('/api/readings?' + params)
+        .then(r => r.json())
+        .then(data => {
+            let html = '';
+            for (let r of data.readings) {
+                let psi = r.pressure_kpa ? (r.pressure_kpa / 6.89476).toFixed(1) : '-';
+                let battClass = r.battery_ok === 1 ? 'badge-green' : r.battery_ok === 0 ? 'badge-red' : '';
+                let battText = r.battery_ok === 1 ? 'OK' : r.battery_ok === 0 ? 'LOW' : '-';
+                let bandColor = (r.frequency_mhz && r.frequency_mhz < 400) ? 'badge-green' : 'badge-cyan';
+                let bandText = (r.frequency_mhz && r.frequency_mhz < 400) ? '315' : '433';
+
+                html += `<tr>
+                    <td class="mono dim">${r.id}</td>
+                    <td class="mono dim">${r.timestamp || '-'}</td>
+                    <td><span class="badge ${bandColor}">${bandText}</span></td>
+                    <td class="mono">${r.protocol || '-'}</td>
+                    <td class="mono">${r.model || '-'}</td>
+                    <td class="mono" style="color:var(--cyan)">${r.sensor_id || '-'}</td>
+                    <td>${r.pressure_kpa ? r.pressure_kpa.toFixed(1) : '-'}</td>
+                    <td>${psi}</td>
+                    <td>${r.temperature_c != null ? r.temperature_c.toFixed(1) : '-'}</td>
+                    <td>${battClass ? '<span class="badge ' + battClass + '">' + battText + '</span>' : '-'}</td>
+                    <td class="mono dim">${r.flags || '-'}</td>
+                </tr>`;
+            }
+            document.getElementById('readings-tbody').innerHTML = html || '<tr><td colspan="11" class="empty">No readings found</td></tr>';
+
+            // Pagination
+            let pag = '';
+            pag += `<button onclick="loadReadings(${data.page - 1})" ${data.page <= 1 ? 'disabled' : ''}>Prev</button>`;
+            pag += `<span class="info">Page ${data.page} of ${data.pages} (${data.total.toLocaleString()} total)</span>`;
+            pag += `<button onclick="loadReadings(${data.page + 1})" ${data.page >= data.pages ? 'disabled' : ''}>Next</button>`;
+            document.getElementById('pagination').innerHTML = pag;
+        });
+}
+
+loadReadings(1);
+</script>
+{% endblock %}

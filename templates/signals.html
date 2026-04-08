@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}All Signals{% endblock %}
+{% block content %}
+<h1 style="font-size:1.5em;margin-bottom:24px">All Decoded Signals</h1>
+<p class="dim" style="margin-bottom:16px">Every signal decoded by rtl_433, including non-TPMS (weather stations, remotes, etc.)</p>
+
+<div class="card">
+    <div class="filters">
+        <select id="filter-type" onchange="loadSignals(1)">
+            <option value="">All types</option>
+            <option value="TPMS">TPMS only</option>
+        </select>
+    </div>
+    <div style="overflow-x:auto">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Timestamp</th>
+                    <th>Band</th>
+                    <th>Freq (MHz)</th>
+                    <th>Protocol</th>
+                    <th>Model</th>
+                    <th>Type</th>
+                    <th>Sensor ID</th>
+                    <th>RSSI</th>
+                    <th>SNR</th>
+                    <th>Noise</th>
+                </tr>
+            </thead>
+            <tbody id="signals-tbody">
+                <tr><td colspan="11" class="empty">Loading...</td></tr>
+            </tbody>
+        </table>
+    </div>
+    <div class="pagination" id="pagination"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentPage = 1;
+
+function loadSignals(page) {
+    currentPage = page || 1;
+    const typeFilter = document.getElementById('filter-type').value;
+    const params = new URLSearchParams({page: currentPage, per_page: 50});
+    if (typeFilter) params.set('type', typeFilter);
+
+    fetch('/api/signals?' + params)
+        .then(r => r.json())
+        .then(data => {
+            let html = '';
+            for (let s of data.signals) {
+                let typeBadge = '';
+                if (s.type === 'TPMS') typeBadge = '<span class="badge badge-green">TPMS</span>';
+                else if (s.type) typeBadge = `<span class="badge badge-cyan">${s.type}</span>`;
+                else typeBadge = '<span class="dim">-</span>';
+
+                let bandLabel = s.frequency_label || '-';
+                let bandClass = bandLabel.includes('315') ? 'badge-green' : 'badge-cyan';
+
+                let rssiColor = 'var(--text-dim)';
+                if (s.rssi != null) {
+                    if (s.rssi > -10) rssiColor = 'var(--green)';
+                    else if (s.rssi > -20) rssiColor = 'var(--yellow)';
+                    else rssiColor = 'var(--red)';
+                }
+
+                html += `<tr>
+                    <td class="mono dim">${s.id}</td>
+                    <td class="mono dim">${s.timestamp || '-'}</td>
+                    <td><span class="badge ${bandClass}">${bandLabel}</span></td>
+                    <td class="mono">${s.frequency_mhz ? s.frequency_mhz.toFixed(3) : '-'}</td>
+                    <td class="mono">${s.protocol || '-'}</td>
+                    <td class="mono">${s.model || '-'}</td>
+                    <td>${typeBadge}</td>
+                    <td class="mono" style="color:var(--cyan)">${s.sensor_id || '-'}</td>
+                    <td style="color:${rssiColor}">${s.rssi != null ? s.rssi.toFixed(1) : '-'}</td>
+                    <td>${s.snr != null ? s.snr.toFixed(1) : '-'}</td>
+                    <td class="dim">${s.noise != null ? s.noise.toFixed(1) : '-'}</td>
+                </tr>`;
+            }
+            document.getElementById('signals-tbody').innerHTML = html || '<tr><td colspan="11" class="empty">No signals found</td></tr>';
+
+            let pag = '';
+            pag += `<button onclick="loadSignals(${data.page - 1})" ${data.page <= 1 ? 'disabled' : ''}>Prev</button>`;
+            pag += `<span class="info">Page ${data.page} of ${data.pages} (${data.total.toLocaleString()} total)</span>`;
+            pag += `<button onclick="loadSignals(${data.page + 1})" ${data.page >= data.pages ? 'disabled' : ''}>Next</button>`;
+            document.getElementById('pagination').innerHTML = pag;
+        });
+}
+
+loadSignals(1);
+</script>
+{% endblock %}

@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}TPMS Dashboard{% endblock %}</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --bg-card: #161b22;
+            --bg-hover: #1c2129;
+            --border: #30363d;
+            --text: #e6edf3;
+            --text-dim: #8b949e;
+            --cyan: #58a6ff;
+            --green: #3fb950;
+            --yellow: #d29922;
+            --red: #f85149;
+            --magenta: #bc8cff;
+            --orange: #d18616;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.5;
+        }
+        nav {
+            background: var(--bg-card);
+            border-bottom: 1px solid var(--border);
+            padding: 0 24px;
+            display: flex;
+            align-items: center;
+            height: 56px;
+            gap: 24px;
+        }
+        nav .brand {
+            font-weight: 700;
+            font-size: 1.1em;
+            color: var(--cyan);
+            text-decoration: none;
+        }
+        nav a {
+            color: var(--text-dim);
+            text-decoration: none;
+            padding: 16px 4px;
+            border-bottom: 2px solid transparent;
+            transition: all 0.15s;
+        }
+        nav a:hover, nav a.active {
+            color: var(--text);
+            border-bottom-color: var(--cyan);
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+        }
+        .stat-card .label {
+            font-size: 0.85em;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .stat-card .value {
+            font-size: 2em;
+            font-weight: 700;
+            margin-top: 4px;
+        }
+        .stat-card .value.cyan { color: var(--cyan); }
+        .stat-card .value.green { color: var(--green); }
+        .stat-card .value.yellow { color: var(--yellow); }
+        .stat-card .value.magenta { color: var(--magenta); }
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 24px;
+        }
+        .card h2 {
+            font-size: 1.1em;
+            margin-bottom: 16px;
+            color: var(--text);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9em;
+        }
+        th {
+            text-align: left;
+            padding: 10px 12px;
+            border-bottom: 2px solid var(--border);
+            color: var(--text-dim);
+            font-weight: 600;
+            font-size: 0.85em;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            position: sticky;
+            top: 0;
+            background: var(--bg-card);
+        }
+        td {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: middle;
+        }
+        tr:hover td { background: var(--bg-hover); }
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: 600;
+        }
+        .badge-cyan { background: rgba(88,166,255,0.15); color: var(--cyan); }
+        .badge-green { background: rgba(63,185,80,0.15); color: var(--green); }
+        .badge-yellow { background: rgba(210,153,34,0.15); color: var(--yellow); }
+        .badge-red { background: rgba(248,81,73,0.15); color: var(--red); }
+        .badge-magenta { background: rgba(188,140,255,0.15); color: var(--magenta); }
+        .signal-bar {
+            display: inline-block;
+            height: 12px;
+            border-radius: 2px;
+            min-width: 4px;
+            vertical-align: middle;
+        }
+        .live-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--green);
+            animation: pulse 2s infinite;
+            margin-right: 6px;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        .filters {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 16px;
+            flex-wrap: wrap;
+        }
+        .filters input, .filters select {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 0.9em;
+        }
+        .filters input:focus, .filters select:focus {
+            outline: none;
+            border-color: var(--cyan);
+        }
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 16px;
+        }
+        .pagination button {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 6px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        .pagination button:hover { border-color: var(--cyan); }
+        .pagination button:disabled { opacity: 0.4; cursor: default; }
+        .pagination .info { color: var(--text-dim); padding: 6px 0; }
+        .mono { font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace; }
+        .dim { color: var(--text-dim); }
+        .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+        @media (max-width: 768px) { .two-col { grid-template-columns: 1fr; } }
+        .empty { text-align: center; padding: 40px; color: var(--text-dim); }
+    </style>
+</head>
+<body>
+    <nav>
+        <a href="/" class="brand">TPMS Monitor</a>
+        <a href="/" {% if request.path == '/' %}class="active"{% endif %}>Dashboard</a>
+        <a href="/readings" {% if request.path == '/readings' %}class="active"{% endif %}>Readings</a>
+        <a href="/sensors" {% if request.path == '/sensors' %}class="active"{% endif %}>Sensors</a>
+        <a href="/signals" {% if request.path == '/signals' %}class="active"{% endif %}>All Signals</a>
+    </nav>
+    <div class="container">
+        {% block content %}{% endblock %}
+    </div>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
