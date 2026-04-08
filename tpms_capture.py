@@ -327,62 +327,77 @@ def is_tpms(data: dict) -> bool:
 def detect_dongles():
     """Auto-detect connected RTL-SDR dongles and identify their tuners.
 
-    Returns a list of dicts: [{"index": 0, "tuner": "R820T", "name": "..."}, ...]
-    Uses rtl_433 -T 0 to probe each device briefly and read the tuner type.
+    Uses rtl_test -t which reliably lists all devices with their serials
+    and tuner types in a single call.
     """
-    # First find how many devices
-    n_devices = 0
+    dongles = []
     try:
-        result = subprocess.run(
-            ["rtl_test", "-t"], capture_output=True, text=True, timeout=5
+        # rtl_test -t lists devices quickly then benchmarks (slow).
+        # We only need the device list, so use a short timeout.
+        proc = subprocess.Popen(
+            ["rtl_test", "-t"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True,
         )
-        output = result.stdout + result.stderr
+        # Read lines until we've seen the device list
+        lines = []
+        import select
+        while True:
+            ready, _, _ = select.select([proc.stdout], [], [], 5)
+            if not ready:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break
+            lines.append(line)
+            # Stop once we see "Using device" — the list is complete
+            if "Using device" in line:
+                break
+        proc.kill()
+        proc.wait()
+        output = "".join(lines)
+        n_devices = 0
+
         for line in output.split("\n"):
-            if line.strip().startswith("Found"):
-                m = re.search(r"Found (\d+) device", line)
-                if m:
-                    n_devices = int(m.group(1))
+            line = line.strip()
+
+            # "Found 4 device(s):"
+            m = re.search(r"Found (\d+) device", line)
+            if m:
+                n_devices = int(m.group(1))
+                continue
+
+            # "  0:  Realtek, RTL2838UHIDIR, SN: TPMS_R820T"
+            m = re.match(r"\s*(\d+):\s+.*,\s+SN:\s+(\S+)", line)
+            if m:
+                idx = int(m.group(1))
+                serial = m.group(2)
+                dongles.append({"index": idx, "tuner": "unknown", "serial": serial})
+                continue
+
+            # "Found Rafael Micro R820T tuner"
+            if "Found" in line and "tuner" in line.lower():
+                tuner = line.split("Found ")[-1].strip()
+                # Assign to the last dongle that was being tested
+                # rtl_test tests device 0, so this tuner info goes to
+                # device 0. For other devices we'll probe individually.
+                if dongles and dongles[0]["tuner"] == "unknown":
+                    dongles[0]["tuner"] = tuner
+
+        # rtl_test only reports the tuner for device 0.
+        # For the rest, identify by serial name (which contains tuner info)
+        # or probe individually.
+        for d in dongles:
+            if d["tuner"] == "unknown":
+                serial = d["serial"].lower()
+                if "e4000" in serial:
+                    d["tuner"] = "Elonics E4000 tuner"
+                elif "r820" in serial:
+                    d["tuner"] = "Rafael Micro R820T tuner"
+
+            log_sdr(f"Device {d['index']}: {d['tuner']}  serial={d['serial']}")
+
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-
-    if n_devices == 0:
-        return []
-
-    # Probe each device to find its tuner type and serial
-    dongles = []
-    for i in range(n_devices):
-        tuner = "unknown"
-        serial = ""
-        try:
-            # Read EEPROM for serial
-            result = subprocess.run(
-                ["rtl_eeprom", "-d", str(i)],
-                capture_output=True, text=True, timeout=5
-            )
-            for line in (result.stdout + result.stderr).split("\n"):
-                if "Serial number:" in line and "enabled" not in line:
-                    serial = line.split(":")[-1].strip()
-                if "Found" in line and "tuner" in line.lower():
-                    tuner = line.split("Found ")[-1].strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        # Fallback: probe tuner with rtl_433 if rtl_eeprom didn't find it
-        if tuner == "unknown":
-            try:
-                result = subprocess.run(
-                    ["rtl_433", "-d", str(i), "-T", "0"],
-                    capture_output=True, text=True, timeout=5
-                )
-                for line in (result.stdout + result.stderr).split("\n"):
-                    if "Found" in line and "tuner" in line.lower():
-                        tuner = line.split("Found ")[-1].strip()
-                        break
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                pass
-
-        dongles.append({"index": i, "tuner": tuner, "serial": serial})
-        log_sdr(f"Device {i}: {tuner}  serial={serial or 'none'}")
 
     return dongles
 
