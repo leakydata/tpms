@@ -806,6 +806,7 @@ class TPMSCapture:
         - Pressure outside tire range (80-500 kPa)
         - Temperature outside plausible range (-30 to 80 C)
         - Very weak RSSI (<-30 dB) — corrupt bits
+        - Unverified CRC/checksum at weak RSSI
         """
         sid = fields["sensor_id"]
         if not sid:
@@ -824,7 +825,52 @@ class TPMSCapture:
         if rssi is not None and rssi < MIN_RSSI_DB:
             return False, f"RSSI {rssi:.1f}dB too weak"
 
+        # CRC/checksum validation — rtl_433 adds "mic" field when it
+        # successfully validates. No mic at weak signal = probably corrupt.
+        mic = str(data.get("mic", "")).upper()
+        has_verified_crc = mic in ("CRC", "CHECKSUM", "PARITY")
+        if not has_verified_crc and rssi is not None and rssi < -20:
+            return False, f"no CRC verification at RSSI {rssi:.1f}dB"
+
         return True, "ok"
+
+    def _is_duplicate_burst(self, sid, model, pressure_kpa, temp_c, window_secs=2):
+        """Check if an identical decode (same sid+model+pressure+temp)
+        was committed within the last N seconds. Multiple transmissions
+        of the same reading from a burst should be stored once.
+        """
+        now = datetime.now(timezone.utc)
+        for (t, s, m, p, temp) in self._recent_decodes:
+            age = (now - t).total_seconds()
+            if age > window_secs:
+                continue
+            if s == sid and m == model:
+                # Same sensor within window
+                if (pressure_kpa == p or
+                    (pressure_kpa is not None and p is not None and
+                     abs(pressure_kpa - p) < 1)):
+                    # Same pressure (within 1 kPa) = duplicate
+                    if (temp == temp_c or
+                        (temp is not None and temp_c is not None and
+                         abs(temp - temp_c) < 2)):
+                        return True
+        return False
+
+    def _is_pressure_jump(self, sid, pressure_kpa, window_secs=60):
+        """Flag readings where same sensor's pressure jumps >50 kPa
+        within a short window — likely a decode error on one of them."""
+        if pressure_kpa is None:
+            return False, None
+        now = datetime.now(timezone.utc)
+        for (t, s, _m, p, _temp) in self._recent_decodes:
+            age = (now - t).total_seconds()
+            if age > window_secs:
+                continue
+            if s == sid and p is not None:
+                diff = abs(p - pressure_kpa)
+                if diff > 50:
+                    return True, diff
+        return False, None
 
     def _count_recent_repeats(self, sid, model, pressure_kpa, window_secs=15):
         """Count how many times this sensor_id+model appeared in the
@@ -866,6 +912,26 @@ class TPMSCapture:
             log_info(f"[{freq_label}] REJECT  {model} {sid or '?'}: {reason}")
             return
 
+        # Cross-burst duplicate suppression: same sensor transmitting the
+        # same reading within 2 seconds = one physical event, not multiple.
+        if self._is_duplicate_burst(
+            sid, model, fields["pressure_kpa"], fields["temperature_c"]
+        ):
+            self.stats["rejected_duplicate"] += 1
+            log_info(f"[{freq_label}] SKIP    {model} {sid}: duplicate within 2s")
+            return
+
+        # Pressure jump detection: same sensor changing pressure by >50 kPa
+        # in under 60 seconds is physically impossible — one reading is wrong.
+        is_jump, jump_amt = self._is_pressure_jump(sid, fields["pressure_kpa"])
+        if is_jump:
+            self.stats["rejected_pressure_jump"] += 1
+            log_info(
+                f"[{freq_label}] REJECT  {model} {sid}: "
+                f"pressure jump {jump_amt:.0f} kPa in <60s (suspect decode)"
+            )
+            return
+
         # Promiscuous decoders need stronger evidence
         is_promiscuous = model in PROMISCUOUS_PROTOCOLS
         if is_promiscuous:
@@ -884,6 +950,18 @@ class TPMSCapture:
                      fields["pressure_kpa"], fields["temperature_c"])
                 )
                 return
+
+        # Universal weak-signal confidence check (applies to ALL decoders):
+        # RSSI < -25 dB with no CRC verification = reject
+        mic = str(data.get("mic", "")).upper()
+        has_verified_crc = mic in ("CRC", "CHECKSUM", "PARITY")
+        if rssi is not None and rssi < -25 and not has_verified_crc:
+            self.stats["rejected_weak_unverified"] += 1
+            log_info(
+                f"[{freq_label}] REJECT  {model} {sid}: "
+                f"RSSI {rssi:.1f}dB + no CRC verification"
+            )
+            return
 
         # Track this decode for future repeat detection
         self._recent_decodes.append(
@@ -1100,6 +1178,11 @@ class TPMSCapture:
             f"tpms_readings={self.stats['total_readings']} (315:{r315} 433:{r433})  "
             f"non_tpms={self.stats.get('non_tpms_signals', 0)}  "
             f"unknown={self.stats.get('unknown_signals', 0)} (filtered:{self.stats.get('unknown_filtered', 0)})  "
+            f"rejected=(invalid:{self.stats.get('rejected_invalid', 0)} "
+            f"dup:{self.stats.get('rejected_duplicate', 0)} "
+            f"lowconf:{self.stats.get('rejected_low_confidence', 0)} "
+            f"weak:{self.stats.get('rejected_weak_unverified', 0)} "
+            f"jump:{self.stats.get('rejected_pressure_jump', 0)})  "
             f"sensors={self.stats['unique_sensors']}  "
             f"est_vehicles=~{est_v}"
         )
