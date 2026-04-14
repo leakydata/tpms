@@ -21,6 +21,9 @@
                     <th>ID</th>
                     <th>Timestamp</th>
                     <th>Band</th>
+                    <th>Conf</th>
+                    <th>CRC</th>
+                    <th>Dir</th>
                     <th>Protocol</th>
                     <th>Model</th>
                     <th>Sensor ID</th>
@@ -32,7 +35,7 @@
                 </tr>
             </thead>
             <tbody id="readings-tbody">
-                <tr><td colspan="11" class="empty">Loading...</td></tr>
+                <tr><td colspan="14" class="empty">Loading...</td></tr>
             </tbody>
         </table>
     </div>
@@ -63,10 +66,28 @@ function loadReadings(page) {
                 let bandColor = (r.frequency_mhz && r.frequency_mhz < 400) ? 'badge-green' : 'badge-cyan';
                 let bandText = (r.frequency_mhz && r.frequency_mhz < 400) ? '315' : '433';
 
+                // Confidence badge with color gradient
+                let confBadge = '-';
+                if (r.confidence != null) {
+                    let cc = r.confidence >= 70 ? 'badge-green' :
+                             r.confidence >= 40 ? 'badge-yellow' : 'badge-red';
+                    confBadge = `<span class="badge ${cc}">${r.confidence}</span>`;
+                }
+                let crcBadge = r.crc_verified === 1 ?
+                    '<span class="badge badge-green">✓</span>' :
+                    r.crc_verified === 0 ? '<span class="dim">-</span>' : '<span class="dim">-</span>';
+                let dirIcon = '-';
+                if (r.direction === 'approaching') dirIcon = '<span style="color:var(--green)">→</span>';
+                else if (r.direction === 'departing') dirIcon = '<span style="color:var(--yellow)">←</span>';
+                else if (r.direction === 'stationary') dirIcon = '<span class="dim">·</span>';
+
                 html += `<tr>
                     <td class="mono dim">${r.id}</td>
                     <td class="mono dim">${r.timestamp || '-'}</td>
                     <td><span class="badge ${bandColor}">${bandText}</span></td>
+                    <td>${confBadge}</td>
+                    <td>${crcBadge}</td>
+                    <td>${dirIcon}</td>
                     <td class="mono">${r.protocol || '-'}</td>
                     <td class="mono">${r.model || '-'}</td>
                     <td class="mono" style="color:var(--cyan)">${r.sensor_id || '-'}</td>
@@ -77,7 +98,7 @@ function loadReadings(page) {
                     <td class="mono dim">${r.flags || '-'}</td>
                 </tr>`;
             }
-            document.getElementById('readings-tbody').innerHTML = html || '<tr><td colspan="11" class="empty">No readings found</td></tr>';
+            document.getElementById('readings-tbody').innerHTML = html || '<tr><td colspan="14" class="empty">No readings found</td></tr>';
 
             // Pagination
             let pag = '';

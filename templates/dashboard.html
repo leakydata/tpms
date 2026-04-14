@@ -20,6 +20,9 @@
     <div class="stat-card"><div class="label">TPMS Readings</div><div class="value green" id="stat-readings">-</div></div>
     <div class="stat-card"><div class="label">Unique Sensors</div><div class="value yellow" id="stat-sensors">-</div></div>
     <div class="stat-card"><div class="label">Est. Vehicles</div><div class="value magenta" id="stat-vehicles">-</div></div>
+    <div class="stat-card"><div class="label">Full Vehicles (2+ tires)</div><div class="value" id="stat-full-vehicles" style="color:var(--green)">-</div></div>
+    <div class="stat-card"><div class="label">Re-identified Sensors</div><div class="value" id="stat-repeat-sensors" style="color:var(--magenta)">-</div></div>
+    <div class="stat-card"><div class="label">Avg Confidence</div><div class="value" id="stat-avg-conf" style="color:var(--cyan)">-</div></div>
     <div class="stat-card"><div class="label">Unknown Signals</div><div class="value" id="stat-unknown" style="color:var(--orange,#d18616)">-</div></div>
     <div class="stat-card"><div class="label">315 MHz</div><div class="value" id="stat-315" style="color:var(--text)">-</div></div>
     <div class="stat-card"><div class="label">433 MHz</div><div class="value" id="stat-433" style="color:var(--text)">-</div></div>
@@ -258,6 +261,17 @@ function loadStats() {
             document.getElementById('stat-433').textContent = data.readings_433.toLocaleString();
             if (data.unknown_signals !== undefined) {
                 document.getElementById('stat-unknown').textContent = data.unknown_signals.toLocaleString();
+            }
+            if (data.full_vehicles !== undefined) {
+                document.getElementById('stat-full-vehicles').textContent = data.full_vehicles.toLocaleString();
+            }
+            if (data.repeat_sensors !== undefined) {
+                document.getElementById('stat-repeat-sensors').textContent = data.repeat_sensors.toLocaleString();
+            }
+            if (data.avg_confidence !== null && data.avg_confidence !== undefined) {
+                document.getElementById('stat-avg-conf').textContent = data.avg_confidence.toFixed(0);
+            } else {
+                document.getElementById('stat-avg-conf').textContent = '-';
             }
 
             let html = '';

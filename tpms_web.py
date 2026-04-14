@@ -88,6 +88,35 @@ def api_stats():
         if "unknown_signals" in unknown_tables:
             unknown_count = db.execute("SELECT COUNT(*) FROM unknown_signals").fetchone()[0]
 
+        # Re-identification metrics (for research)
+        try:
+            repeat_sensors = db.execute(
+                "SELECT COUNT(*) FROM sensors WHERE sighting_count > 1"
+            ).fetchone()[0]
+            total_sightings = db.execute(
+                "SELECT COALESCE(SUM(sighting_count), 0) FROM sensors"
+            ).fetchone()[0]
+        except Exception:
+            repeat_sensors = 0
+            total_sightings = 0
+
+        # Average confidence of recent readings
+        try:
+            avg_conf_row = db.execute(
+                "SELECT AVG(confidence) FROM readings WHERE confidence IS NOT NULL"
+            ).fetchone()
+            avg_confidence = avg_conf_row[0] if avg_conf_row and avg_conf_row[0] else None
+        except Exception:
+            avg_confidence = None
+
+        # High-confidence vehicles (groups with 2+ tires)
+        try:
+            full_vehicles = db.execute(
+                "SELECT COUNT(*) FROM vehicles WHERE json_array_length(sensor_ids) >= 2"
+            ).fetchone()[0]
+        except Exception:
+            full_vehicles = 0
+
         return jsonify({
             "total_signals": total_signals,
             "total_readings": total_readings,
@@ -96,6 +125,10 @@ def api_stats():
             "unique_sensors": unique_sensors,
             "est_vehicles": est_vehicles,
             "unknown_signals": unknown_count,
+            "repeat_sensors": repeat_sensors,
+            "total_sightings": total_sightings,
+            "full_vehicles": full_vehicles,
+            "avg_confidence": round(avg_confidence, 1) if avg_confidence else None,
             "first_reading": first,
             "last_reading": last,
             "readings_315": r315,

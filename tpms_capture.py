@@ -245,6 +245,8 @@ def init_db():
     # SQLite doesn't error on duplicate ALTER ADD, so we catch and ignore.
     migrations = [
         "ALTER TABLE readings ADD COLUMN signal_id INTEGER REFERENCES signals(id)",
+        "ALTER TABLE readings ADD COLUMN confidence INTEGER",
+        "ALTER TABLE readings ADD COLUMN crc_verified INTEGER",
         "ALTER TABLE unknown_signals ADD COLUMN pulse_count INTEGER",
         "ALTER TABLE unknown_signals ADD COLUMN width_ms REAL",
         "ALTER TABLE unknown_signals ADD COLUMN modulation TEXT",
@@ -252,6 +254,18 @@ def init_db():
         "ALTER TABLE unknown_signals ADD COLUMN fingerprint TEXT",
         "ALTER TABLE unknown_signals ADD COLUMN triq_url TEXT",
         "ALTER TABLE unknown_signals ADD COLUMN iq_filename TEXT",
+        # Re-identification tracking
+        "ALTER TABLE sensors ADD COLUMN sighting_count INTEGER DEFAULT 1",
+        "ALTER TABLE sensors ADD COLUMN mean_interval_secs REAL",
+        "ALTER TABLE sensors ADD COLUMN last_interval_secs REAL",
+        "ALTER TABLE sensors ADD COLUMN frequency_label TEXT",
+        "ALTER TABLE sensors ADD COLUMN confidence_avg REAL",
+        # Motion detection
+        "ALTER TABLE readings ADD COLUMN direction TEXT",
+        "ALTER TABLE readings ADD COLUMN rssi_trend REAL",
+        # Receiver noise floor monitoring
+        "ALTER TABLE receivers ADD COLUMN noise_floor_db REAL",
+        "ALTER TABLE receivers ADD COLUMN noise_floor_baseline REAL",
     ]
     for sql in migrations:
         try:
@@ -443,6 +457,11 @@ class TPMSCapture:
         # (timestamp_utc, sensor_id, model, pressure_kpa, temperature_c)
         self._recent_decodes = deque(maxlen=500)
         self._pending_decodes = {}  # (sid, model) -> list of pending decodes awaiting repeat
+        # Rolling RSSI log for motion/direction detection:
+        # (timestamp, sensor_id, model, pressure, temp, rssi)
+        self._recent_rssi_log = deque(maxlen=500)
+        # Noise floor samples per device for monitoring dongle health
+        self._noise_samples = defaultdict(lambda: deque(maxlen=50))
 
     def build_rtl433_cmd(self, device_index: int, frequency: int) -> list:
         protocol_args = []
@@ -889,6 +908,111 @@ class TPMSCapture:
                     count += 1
         return count
 
+    def _compute_confidence(self, rssi, snr, mic, model, repeats, pressure_kpa):
+        """Compute a confidence score (0-100) for a TPMS decode.
+
+        Factors:
+        - RSSI strength (up to 30 points)
+        - SNR (up to 15 points)
+        - CRC verification (15 points)
+        - Repeat confirmations (up to 25 points)
+        - Pressure plausibility (up to 5 points)
+        - Promiscuous decoder penalty (-10 points)
+        """
+        score = 30  # base score
+
+        if rssi is not None:
+            if rssi > -10: score += 30
+            elif rssi > -15: score += 25
+            elif rssi > -20: score += 15
+            elif rssi > -25: score += 5
+            else: score -= 10
+
+        if snr is not None:
+            if snr > 25: score += 15
+            elif snr > 15: score += 10
+            elif snr > 8: score += 5
+
+        if mic and str(mic).upper() in ("CRC", "CHECKSUM", "PARITY"):
+            score += 15
+
+        score += min(25, repeats * 8)
+
+        if pressure_kpa is not None:
+            if 180 <= pressure_kpa <= 320:  # typical passenger car range
+                score += 5
+
+        if model in PROMISCUOUS_PROTOCOLS:
+            score -= 10
+
+        return max(0, min(100, score))
+
+    def _detect_direction(self, sid, model, window_secs=10):
+        """Detect vehicle direction from RSSI trend across recent decodes.
+
+        Returns (direction, rssi_slope_db_per_s):
+        - "approaching" if RSSI is rising
+        - "departing" if RSSI is falling
+        - "stationary" if flat
+        - (None, None) if insufficient data
+        """
+        now = datetime.now(timezone.utc)
+        points = []  # (age_secs, rssi)
+        for (t, s, m, _p, _temp, rssi_val) in self._recent_rssi_log:
+            if s == sid and m == model:
+                age = (now - t).total_seconds()
+                if age < window_secs and rssi_val is not None:
+                    points.append((age, rssi_val))
+
+        if len(points) < 3:
+            return None, None
+
+        # Simple linear regression: RSSI vs negative age (age=0 is now)
+        # Rising RSSI over time = approaching
+        n = len(points)
+        x_vals = [-p[0] for p in points]  # negate so larger = more recent
+        y_vals = [p[1] for p in points]
+        mean_x = sum(x_vals) / n
+        mean_y = sum(y_vals) / n
+        num = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_vals, y_vals))
+        den = sum((x - mean_x) ** 2 for x in x_vals)
+        if den == 0:
+            return "stationary", 0.0
+
+        slope = num / den  # dB per second (positive = rising = approaching)
+
+        if slope > 0.5:
+            return "approaching", slope
+        elif slope < -0.5:
+            return "departing", slope
+        else:
+            return "stationary", slope
+
+    def _validate_sensor_id(self, sid, model):
+        """Validate sensor ID matches the model's expected format.
+
+        Uses observed ID length statistics: learns from the first several
+        readings of each model what the typical hex ID length is, and
+        rejects outliers.
+        """
+        if not sid:
+            return False, "empty id"
+        if not all(c in "0123456789abcdefABCDEF" for c in sid):
+            return False, f"id '{sid}' not hex"
+        # Track expected length per model (learned from real data)
+        if not hasattr(self, '_model_id_lengths'):
+            self._model_id_lengths = defaultdict(list)
+        self._model_id_lengths[model].append(len(sid))
+        if len(self._model_id_lengths[model]) > 3:
+            # Learned enough to validate
+            lengths = self._model_id_lengths[model][-20:]  # keep rolling window
+            self._model_id_lengths[model] = lengths
+            common = max(set(lengths), key=lengths.count)
+            # Allow ±2 chars flexibility
+            if abs(len(sid) - common) > 2:
+                return False, f"id length {len(sid)} differs from expected {common} for {model}"
+        return True, "ok"
+
     def _commit_tpms(self, data, fields, freq_label):
         """Store a TPMS decode in both signals and readings tables, update sensor.
 
@@ -963,13 +1087,53 @@ class TPMSCapture:
             )
             return
 
+        # Sensor ID format validation per model
+        id_ok, id_reason = self._validate_sensor_id(sid, model)
+        if not id_ok:
+            self.stats["rejected_invalid_id"] += 1
+            log_info(f"[{freq_label}] REJECT  {model} {sid}: {id_reason}")
+            return
+
         # Track this decode for future repeat detection
+        now_utc = datetime.now(timezone.utc)
         self._recent_decodes.append(
-            (datetime.now(timezone.utc), sid, model,
+            (now_utc, sid, model,
              fields["pressure_kpa"], fields["temperature_c"])
         )
+        self._recent_rssi_log.append(
+            (now_utc, sid, model, fields["pressure_kpa"],
+             fields["temperature_c"], rssi)
+        )
 
+        # Compute confidence score
+        repeats = self._count_recent_repeats(sid, model, fields["pressure_kpa"])
+        confidence = self._compute_confidence(
+            rssi, snr, data.get("mic"), model, repeats, fields["pressure_kpa"]
+        )
+        crc_verified = 1 if has_verified_crc else 0
+
+        # Motion/direction detection
+        direction, rssi_slope = self._detect_direction(sid, model)
+
+        # Re-identification tracking: compute interval since last sighting
         is_new = sid not in self.unique_sensors
+        last_interval = None
+        if not is_new:
+            # Query existing last_seen from DB
+            with self.lock:
+                prev = self.conn.execute(
+                    "SELECT last_seen FROM sensors WHERE sensor_id = ?", (sid,)
+                ).fetchone()
+                if prev and prev[0]:
+                    try:
+                        prev_t = datetime.fromisoformat(prev[0].replace("Z", "+00:00"))
+                        if prev_t.tzinfo is None:
+                            prev_t = prev_t.replace(tzinfo=timezone.utc)
+                        last_interval = (now_utc - prev_t).total_seconds()
+                        # Only count as a new "sighting" if >60 seconds apart
+                        # (otherwise it's the same pass-by event)
+                    except Exception:
+                        pass
 
         with self.lock:
             # Store in signals table
@@ -983,24 +1147,30 @@ class TPMSCapture:
             )
             signal_id = cur.lastrowid
 
-            # Store in TPMS readings table
+            # Store in TPMS readings table (with confidence + direction)
             self.conn.execute(
                 """INSERT INTO readings
                    (signal_id, timestamp, frequency_mhz, protocol, model, sensor_id,
-                    pressure_kpa, temperature_c, battery_ok, flags, raw_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    pressure_kpa, temperature_c, battery_ok, flags, raw_json,
+                    confidence, crc_verified, direction, rssi_trend)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (signal_id, timestamp, freq_mhz, str(protocol), model, sid,
                  fields["pressure_kpa"], fields["temperature_c"],
-                 fields["battery_ok"], fields["flags"], json.dumps(data)),
+                 fields["battery_ok"], fields["flags"], json.dumps(data),
+                 confidence, crc_verified, direction, rssi_slope),
             )
 
-            # Upsert sensor record
+            # Upsert sensor record with re-identification tracking
+            is_new_sighting = last_interval is None or last_interval > 60
+
             self.conn.execute("""
                 INSERT INTO sensors
                     (sensor_id, model, first_seen, last_seen, reading_count,
                      min_pressure_kpa, max_pressure_kpa, min_temperature_c, max_temperature_c,
-                     last_pressure_kpa, last_temperature_c, last_battery_ok, last_rssi)
-                VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                     last_pressure_kpa, last_temperature_c, last_battery_ok, last_rssi,
+                     sighting_count, mean_interval_secs, last_interval_secs,
+                     frequency_label, confidence_avg)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, NULL, ?, ?)
                 ON CONFLICT(sensor_id) DO UPDATE SET
                     last_seen = excluded.last_seen,
                     reading_count = reading_count + 1,
@@ -1011,12 +1181,33 @@ class TPMSCapture:
                     last_pressure_kpa = COALESCE(excluded.last_pressure_kpa, last_pressure_kpa),
                     last_temperature_c = COALESCE(excluded.last_temperature_c, last_temperature_c),
                     last_battery_ok = COALESCE(excluded.last_battery_ok, last_battery_ok),
-                    last_rssi = COALESCE(excluded.last_rssi, last_rssi)
-            """, (sid, model, timestamp, timestamp,
-                  fields["pressure_kpa"], fields["pressure_kpa"],
-                  fields["temperature_c"], fields["temperature_c"],
-                  fields["pressure_kpa"], fields["temperature_c"],
-                  fields["battery_ok"], rssi))
+                    last_rssi = COALESCE(excluded.last_rssi, last_rssi),
+                    frequency_label = excluded.frequency_label,
+                    sighting_count = sighting_count + CASE WHEN ? THEN 1 ELSE 0 END,
+                    last_interval_secs = CASE WHEN ? THEN ? ELSE last_interval_secs END,
+                    mean_interval_secs = CASE
+                        WHEN ? AND mean_interval_secs IS NULL THEN ?
+                        WHEN ? THEN (mean_interval_secs * (sighting_count - 1) + ?) / sighting_count
+                        ELSE mean_interval_secs
+                    END,
+                    confidence_avg = CASE
+                        WHEN confidence_avg IS NULL THEN ?
+                        ELSE (confidence_avg * (reading_count - 1) + ?) / reading_count
+                    END
+            """, (
+                sid, model, timestamp, timestamp,
+                fields["pressure_kpa"], fields["pressure_kpa"],
+                fields["temperature_c"], fields["temperature_c"],
+                fields["pressure_kpa"], fields["temperature_c"],
+                fields["battery_ok"], rssi,
+                freq_label, confidence,
+                # ON CONFLICT params:
+                is_new_sighting,
+                is_new_sighting, last_interval,
+                is_new_sighting, last_interval,
+                is_new_sighting, last_interval,
+                confidence, confidence,
+            ))
 
             self.conn.commit()
 
@@ -1026,6 +1217,12 @@ class TPMSCapture:
             self.unique_sensors.add(sid)
             self.stats["unique_sensors"] = len(self.unique_sensors)
             self.sensor_models[sid] = model
+
+        # Update dongle noise floor for health monitoring
+        if noise is not None:
+            dev_idx_noise = self._freq_label_to_device(freq_label)
+            if dev_idx_noise is not None:
+                self._noise_samples[dev_idx_noise].append(noise)
 
         dev_idx = self._freq_label_to_device(freq_label)
         if dev_idx is not None:
@@ -1050,6 +1247,29 @@ class TPMSCapture:
         if freq_mhz:
             parts.append(f"freq={freq_mhz:.3f}MHz")
         parts.append(f"proto={protocol}")
+
+        # Confidence + direction + CRC flags
+        conf_color = (
+            C["green"] if confidence >= 70
+            else C["yellow"] if confidence >= 40
+            else C["red"]
+        )
+        parts.append(f"conf={conf_color}{confidence}{C['reset']}")
+        if crc_verified:
+            parts.append(f"{C['green']}✓CRC{C['reset']}")
+        if direction:
+            arrow = "→" if direction == "approaching" else "←" if direction == "departing" else "·"
+            parts.append(f"{arrow}{direction}")
+        if last_interval is not None and not is_new_sighting:
+            # Part of same pass-by event
+            parts.append(f"burst+{last_interval:.0f}s")
+        elif last_interval is not None:
+            # Re-identification! Sensor seen before, but different event
+            mins = last_interval / 60
+            if mins < 60:
+                parts.append(f"{C['magenta']}↻ seen {mins:.0f}m ago{C['reset']}")
+            else:
+                parts.append(f"{C['magenta']}↻ seen {mins/60:.1f}h ago{C['reset']}")
 
         new_tag = f"  {C['yellow']}** NEW SENSOR **{C['reset']}" if is_new else ""
         log_rx("  ".join(parts) + new_tag)
@@ -1152,6 +1372,92 @@ class TPMSCapture:
             self._update_receiver(device_index, status="error",
                                   last_error="stopped unexpectedly")
 
+    def _check_noise_floors(self):
+        """Monitor dongle noise floors, warn on degradation."""
+        for dev_idx, samples in self._noise_samples.items():
+            if len(samples) < 10:
+                continue
+            recent = list(samples)[-10:]
+            avg_recent = sum(recent) / len(recent)
+
+            # Update DB with current noise floor
+            try:
+                with self.lock:
+                    # Fetch existing baseline
+                    row = self.conn.execute(
+                        "SELECT noise_floor_baseline FROM receivers WHERE device_index = ?",
+                        (dev_idx,)
+                    ).fetchone()
+                    baseline = row[0] if row and row[0] else None
+
+                    if baseline is None:
+                        # Set initial baseline
+                        self.conn.execute(
+                            "UPDATE receivers SET noise_floor_baseline = ?, noise_floor_db = ? WHERE device_index = ?",
+                            (avg_recent, avg_recent, dev_idx),
+                        )
+                    else:
+                        # Update current noise floor
+                        self.conn.execute(
+                            "UPDATE receivers SET noise_floor_db = ? WHERE device_index = ?",
+                            (avg_recent, dev_idx),
+                        )
+                        # Alert on degradation (noise rising by 6+ dB = 4x louder)
+                        if avg_recent - baseline > 6:
+                            info = self._receiver_info.get(dev_idx, {})
+                            label = info.get("label", f"device{dev_idx}")
+                            log_warn(
+                                f"[{label}] noise floor {avg_recent:+.1f}dB "
+                                f"rose {avg_recent - baseline:+.1f}dB above baseline "
+                                f"({baseline:+.1f}dB) — check antenna/interference"
+                            )
+                    self.conn.commit()
+            except sqlite3.OperationalError:
+                pass  # table not ready yet
+
+    def _maybe_export_csv(self):
+        """Once per day, export today's readings to a CSV archive."""
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        last_export = getattr(self, "_last_csv_export_date", None)
+        if last_export == today_str:
+            return
+        if last_export is None:
+            self._last_csv_export_date = today_str
+            return  # don't export on first run
+
+        # New day — export the previous day's data
+        export_dir = Path(__file__).parent / "exports"
+        export_dir.mkdir(exist_ok=True)
+        csv_path = export_dir / f"readings_{last_export}.csv"
+
+        try:
+            with self.lock:
+                rows = self.conn.execute(
+                    """SELECT timestamp, frequency_mhz, protocol, model, sensor_id,
+                              pressure_kpa, temperature_c, battery_ok, flags,
+                              confidence, crc_verified, direction
+                       FROM readings
+                       WHERE date(timestamp) = ?
+                       ORDER BY timestamp""",
+                    (last_export,)
+                ).fetchall()
+
+            with csv_path.open("w") as f:
+                f.write(
+                    "timestamp,frequency_mhz,protocol,model,sensor_id,"
+                    "pressure_kpa,temperature_c,battery_ok,flags,"
+                    "confidence,crc_verified,direction\n"
+                )
+                for row in rows:
+                    f.write(",".join(str(v) if v is not None else "" for v in row) + "\n")
+
+            log_ok(f"Exported {len(rows)} readings for {last_export} → {csv_path}")
+        except Exception as e:
+            log_warn(f"CSV export failed: {e}")
+
+        self._last_csv_export_date = today_str
+
     def print_periodic_status(self):
         elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
         mins = int(elapsed // 60)
@@ -1167,6 +1473,11 @@ class TPMSCapture:
             elif proc_idx is not None:
                 self._update_receiver(dev_idx, status="error",
                                       last_error=f"exited with code {self.processes[proc_idx].returncode}")
+
+        # Check noise floors and maybe export CSV
+        self._check_noise_floors()
+        self._maybe_export_csv()
+
         r315 = self.stats.get("readings_315MHz", 0)
         r433 = self.stats.get("readings_433MHz", 0)
         est_v = max(1, self.stats["unique_sensors"] // 4) if self.stats["unique_sensors"] > 0 else 0
@@ -1188,53 +1499,130 @@ class TPMSCapture:
         )
 
     def correlate_vehicles(self):
+        """Group sensors into vehicles using time + model + pressure + band.
+
+        A vehicle has 4-5 tires. Real vehicle groups satisfy:
+        - Sensors appear within a short time window (5s at highway speed)
+        - Tires usually have the same TPMS manufacturer (same model)
+        - Tires on the same vehicle have similar pressure (±30 kPa)
+        - Same frequency band (a vehicle uses one band)
+        - 2-5 sensors per vehicle (singletons are noise)
+        """
         log_info("Correlating sensors into vehicle groups...")
         cur = self.conn.execute("""
             SELECT sensor_id, MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
-                   COUNT(*) as reading_count, model
-            FROM readings GROUP BY sensor_id ORDER BY first_seen
+                   COUNT(*) as reading_count, model,
+                   AVG(pressure_kpa) as avg_pressure,
+                   AVG(frequency_mhz) as avg_freq
+            FROM readings
+            WHERE confidence IS NULL OR confidence >= 40
+            GROUP BY sensor_id
+            ORDER BY first_seen
         """)
         sensors = cur.fetchall()
         if not sensors:
             log_warn("No sensors captured — nothing to correlate")
             return
 
-        groups, current_group, current_time = [], [], None
-        for sid, first_seen, last_seen, count, model in sensors:
+        # Build individual "burst events" (time-adjacent sensors)
+        bursts = []
+        current, current_time = [], None
+        for row in sensors:
+            sid, first_seen, last_seen, count, model, avg_p, avg_freq = row
             t = datetime.fromisoformat(first_seen)
-            # At 40-50 mph, a vehicle passes a ~200ft antenna range in ~3-4 seconds.
-            # TPMS sensors transmit every ~1s when moving. Use a 5-second window
-            # to group sensors from the same vehicle without merging consecutive cars.
             if current_time is None or (t - current_time).total_seconds() < 5:
-                current_group.append((sid, first_seen, last_seen, count, model))
+                current.append(row)
                 if current_time is None:
                     current_time = t
             else:
-                if current_group:
-                    groups.append(current_group)
-                current_group = [(sid, first_seen, last_seen, count, model)]
+                if current:
+                    bursts.append(current)
+                current = [row]
                 current_time = t
-        if current_group:
-            groups.append(current_group)
+        if current:
+            bursts.append(current)
 
-        for group in groups:
-            sensor_ids = sorted(set(s[0] for s in group))
+        # Split each burst into vehicle groups based on model/pressure/band
+        vehicle_groups = []
+        for burst in bursts:
+            # If single sensor, it's either a singleton or part of a larger
+            # vehicle we didn't catch fully — keep it but flag
+            if len(burst) == 1:
+                vehicle_groups.append(burst)
+                continue
+
+            # Group by (model, frequency_band)
+            subgroups = defaultdict(list)
+            for row in burst:
+                sid, fs, ls, cnt, model, avg_p, avg_freq = row
+                band = "315" if (avg_freq or 0) < 400 else "433"
+                subgroups[(model, band)].append(row)
+
+            # Within each subgroup, split further by pressure similarity
+            for sg_key, sg_rows in subgroups.items():
+                # Sort by pressure, group nearby ones
+                sg_rows.sort(key=lambda r: r[5] or 0)
+                clusters = []
+                current_cluster = []
+                last_p = None
+                for row in sg_rows:
+                    p = row[5]
+                    if (last_p is None or p is None or
+                        abs((p or 0) - (last_p or 0)) < 30):
+                        current_cluster.append(row)
+                    else:
+                        if current_cluster:
+                            clusters.append(current_cluster)
+                        current_cluster = [row]
+                    last_p = p
+                if current_cluster:
+                    clusters.append(current_cluster)
+                vehicle_groups.extend(clusters)
+
+        # Store vehicle groups with quality indicators
+        for group in vehicle_groups:
+            sensor_ids = sorted(set(r[0] for r in group))
             vehicle_hash = "|".join(sensor_ids)
-            first_seen = min(s[1] for s in group)
-            last_seen = max(s[2] for s in group)
-            self.conn.execute("""
-                INSERT INTO vehicles (vehicle_hash, sensor_ids, first_seen, last_seen, sighting_count)
-                VALUES (?, ?, ?, ?, 1)
-                ON CONFLICT(vehicle_hash) DO UPDATE SET
-                    last_seen = excluded.last_seen, sighting_count = sighting_count + 1
-            """, (vehicle_hash, json.dumps(sensor_ids), first_seen, last_seen))
-        self.conn.commit()
-        log_ok(f"Correlated into {len(groups)} potential vehicle group(s)")
+            first_seen = min(r[1] for r in group)
+            last_seen = max(r[2] for r in group)
+            # Quality score based on tire count (4 tires = ideal vehicle)
+            n = len(sensor_ids)
+            notes = None
+            if n == 1:
+                notes = "singleton (probably incomplete vehicle)"
+            elif n >= 4:
+                notes = f"high confidence ({n} tires detected)"
+            elif n >= 2:
+                notes = f"partial ({n} tires)"
 
-        for i, group in enumerate(groups, 1):
-            sensor_ids = sorted(set(s[0] for s in group))
-            models = set(s[4] for s in group)
-            log_info(f"  Vehicle {i}: {len(sensor_ids)} sensor(s) — {', '.join(models)}")
+            self.conn.execute("""
+                INSERT INTO vehicles (vehicle_hash, sensor_ids, first_seen, last_seen, sighting_count, notes)
+                VALUES (?, ?, ?, ?, 1, ?)
+                ON CONFLICT(vehicle_hash) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    sighting_count = sighting_count + 1,
+                    notes = excluded.notes
+            """, (vehicle_hash, json.dumps(sensor_ids), first_seen, last_seen, notes))
+        self.conn.commit()
+
+        full_vehicles = [g for g in vehicle_groups if len(g) >= 2]
+        singletons = [g for g in vehicle_groups if len(g) == 1]
+
+        log_ok(
+            f"Correlated: {len(vehicle_groups)} groups — "
+            f"{len(full_vehicles)} likely vehicles ({len(singletons)} singletons)"
+        )
+
+        for i, group in enumerate(vehicle_groups, 1):
+            sensor_ids = sorted(set(r[0] for r in group))
+            models = sorted(set(r[4] for r in group))
+            pressures = [r[5] for r in group if r[5] is not None]
+            pres_range = ""
+            if pressures:
+                pres_range = f"  pressure={min(pressures):.0f}-{max(pressures):.0f}kPa"
+            tag = "" if len(sensor_ids) >= 2 else " (singleton)"
+            log_info(f"  Vehicle {i}: {len(sensor_ids)} tire(s) — "
+                     f"{', '.join(models)}{pres_range}{tag}")
             for sid in sensor_ids:
                 log_info(f"    Sensor ID: {sid}")
 
