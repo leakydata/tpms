@@ -22,7 +22,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
 
 DB_PATH = Path(__file__).parent / "tpms_data.db"
 
@@ -36,12 +36,30 @@ TPMS_PROTOCOLS = {
     201, 203, 208, 212, 225, 226, 241, 248, 252, 257, 275, 295, 298, 299,
 }
 
-# Protocols disabled by default in rtl_433 — we enable them all.
+# Disabled-by-default protocols we selectively enable.
+# NOTE: Protocol 123 (Jansite TY02S) is excluded — its decoder is too
+# permissive and produces many false positives. We keep 248 (Nissan)
+# which has been verified to produce clean, consistent readings.
 DISABLED_BY_DEFAULT = [
     6, 7, 13, 14, 24, 37, 48, 61, 62, 64, 72, 86, 101, 106, 107,
-    117, 118, 123, 129, 150, 162, 169, 198, 200, 216, 233, 242, 245,
+    117, 118, 129, 150, 162, 169, 198, 200, 216, 233, 242, 245,
     248, 260, 270,
 ]
+
+# Protocols with known high false-positive rates. Readings from these
+# decoders require stronger evidence (higher RSSI, or repeats within
+# a short window) to be accepted.
+PROMISCUOUS_PROTOCOLS = {
+    "Jansite",              # protocol 180 — still loose
+    "Jansite-Solar",
+}
+
+# Physical sanity limits for TPMS data
+MIN_PRESSURE_KPA = 80   # ~12 psi — below this is flat or impossible
+MAX_PRESSURE_KPA = 500  # ~73 psi — above this is commercial/truck only
+MIN_TEMP_C = -30        # extreme cold
+MAX_TEMP_C = 80         # hot tire under load
+MIN_RSSI_DB = -30       # below this the signal is too weak to trust
 
 # Frequency presets for TPMS bands
 FREQ_PRESETS = {
@@ -421,6 +439,10 @@ class TPMSCapture:
         self._decode_flush_timer = None
         self._receiver_info = {}  # device_index -> {label, freq, pid, status, ...}
         self._analysis_buffer = {}  # device_index -> list of lines
+        # Track recent TPMS decodes for repeat-confirmation:
+        # (timestamp_utc, sensor_id, model, pressure_kpa, temperature_c)
+        self._recent_decodes = deque(maxlen=500)
+        self._pending_decodes = {}  # (sid, model) -> list of pending decodes awaiting repeat
 
     def build_rtl433_cmd(self, device_index: int, frequency: int) -> list:
         protocol_args = []
@@ -776,8 +798,58 @@ class TPMSCapture:
         if device_index is not None:
             self._update_receiver(device_index, signal_received=True)
 
+    def _validate_tpms(self, fields, data, rssi):
+        """Validate a TPMS decode for physical plausibility.
+
+        Returns (accept, reason). Rejects:
+        - Missing sensor ID (can't track)
+        - Pressure outside tire range (80-500 kPa)
+        - Temperature outside plausible range (-30 to 80 C)
+        - Very weak RSSI (<-30 dB) — corrupt bits
+        """
+        sid = fields["sensor_id"]
+        if not sid:
+            return False, "missing sensor_id"
+
+        pres = fields["pressure_kpa"]
+        if pres is not None:
+            if pres < MIN_PRESSURE_KPA or pres > MAX_PRESSURE_KPA:
+                return False, f"pressure {pres:.0f} kPa out of range"
+
+        temp = fields["temperature_c"]
+        if temp is not None:
+            if temp < MIN_TEMP_C or temp > MAX_TEMP_C:
+                return False, f"temperature {temp:.0f}C out of range"
+
+        if rssi is not None and rssi < MIN_RSSI_DB:
+            return False, f"RSSI {rssi:.1f}dB too weak"
+
+        return True, "ok"
+
+    def _count_recent_repeats(self, sid, model, pressure_kpa, window_secs=15):
+        """Count how many times this sensor_id+model appeared in the
+        last N seconds with the same pressure (within 10 kPa)."""
+        now = datetime.now(timezone.utc)
+        count = 0
+        for (t, s, m, p, _temp) in self._recent_decodes:
+            age = (now - t).total_seconds()
+            if age > window_secs:
+                continue
+            if s == sid and m == model:
+                # Same sensor — check pressure consistency
+                if pressure_kpa is None or p is None:
+                    count += 1
+                elif abs(p - pressure_kpa) <= 10:
+                    count += 1
+        return count
+
     def _commit_tpms(self, data, fields, freq_label):
-        """Store a TPMS decode in both signals and readings tables, update sensor."""
+        """Store a TPMS decode in both signals and readings tables, update sensor.
+
+        Applies sanity filters to reject false decodes. Promiscuous decoders
+        (Jansite, etc.) require stronger evidence — either a strong RSSI or
+        at least one repeat within 15 seconds with consistent pressure.
+        """
         timestamp = data.get("time", datetime.now(timezone.utc).isoformat())
         model = data.get("model", "unknown")
         protocol = data.get("protocol", "")
@@ -786,6 +858,38 @@ class TPMSCapture:
         snr = data.get("snr", None)
         noise = data.get("noise", None)
         sid = fields["sensor_id"]
+
+        # Physical sanity check
+        accept, reason = self._validate_tpms(fields, data, rssi)
+        if not accept:
+            self.stats["rejected_invalid"] += 1
+            log_info(f"[{freq_label}] REJECT  {model} {sid or '?'}: {reason}")
+            return
+
+        # Promiscuous decoders need stronger evidence
+        is_promiscuous = model in PROMISCUOUS_PROTOCOLS
+        if is_promiscuous:
+            repeats = self._count_recent_repeats(sid, model, fields["pressure_kpa"])
+            has_strong_signal = rssi is not None and rssi > -15
+            if repeats == 0 and not has_strong_signal:
+                self.stats["rejected_low_confidence"] += 1
+                log_info(
+                    f"[{freq_label}] REJECT  {model} {sid}: "
+                    f"low confidence (RSSI={rssi}, repeats={repeats}) — "
+                    f"waiting for repeat"
+                )
+                # Track it so future repeats can find it
+                self._recent_decodes.append(
+                    (datetime.now(timezone.utc), sid, model,
+                     fields["pressure_kpa"], fields["temperature_c"])
+                )
+                return
+
+        # Track this decode for future repeat detection
+        self._recent_decodes.append(
+            (datetime.now(timezone.utc), sid, model,
+             fields["pressure_kpa"], fields["temperature_c"])
+        )
 
         is_new = sid not in self.unique_sensors
 
